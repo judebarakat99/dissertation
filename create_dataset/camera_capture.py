@@ -6,9 +6,9 @@ import time
 
 # === Configuration ===
 total_images = 200
-delay_seconds = 1
-rgb_folder = "raw_images_RGB2"
-depth_folder = "raw_images_depth2"
+delay_seconds = 0.25
+rgb_folder = "raw_images_RGB3"
+depth_folder = "raw_images_depth3"
 
 # Create folders if they don't exist
 os.makedirs(rgb_folder, exist_ok=True)
