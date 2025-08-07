@@ -2222,3 +2222,4 @@ my_ML/raw_images_RGB_annotated_coco/val/img-47_5_png.rf.82c88cf757785d229529f56d
 my_ML/raw_images_RGB_annotated_coco/val/img-49_6_png.rf.56272bf3fb1c2a72494e3969ea5f36bd.jpg
 my_ML/raw_images_RGB_annotated_coco/val/img-50_7_png.rf.d6c5487d87606128e9d95c41dd5ae9b8.jpg
 my_ML/raw_images_RGB_annotated_coco/val/val_annotations.json
+my_ML/cuts_detector_best.pth
