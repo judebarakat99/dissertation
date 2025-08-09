@@ -1,0 +1,8 @@
+{"epoch": 1, "train_loss": 1.826029019696372, "val_loss": 1.5340329170227052, "avg_dets_per_img": 0.0, "lr": 0.005, "epoch_seconds": 652.9669034481049, "timestamp": "2025-08-09 04:37:58"}
+{"epoch": 2, "train_loss": 1.5698351315089634, "val_loss": 1.3544061660766602, "avg_dets_per_img": 0.0, "lr": 0.005, "epoch_seconds": 724.1497566699982, "timestamp": "2025-08-09 04:50:59"}
+{"epoch": 3, "train_loss": 1.297848105430603, "val_loss": 1.0080392201741537, "avg_dets_per_img": 0.0, "lr": 0.0005, "epoch_seconds": 763.8337967395782, "timestamp": "2025-08-09 05:04:46"}
+{"epoch": 4, "train_loss": 1.0448921586785997, "val_loss": 0.7822739322980244, "avg_dets_per_img": 0.0, "lr": 0.0005, "epoch_seconds": 807.7187147140503, "timestamp": "2025-08-09 05:19:18"}
+{"epoch": 5, "train_loss": 0.8652953105313438, "val_loss": 0.6566834489504496, "avg_dets_per_img": 0.0, "lr": 0.0005, "epoch_seconds": 812.4168584346771, "timestamp": "2025-08-09 05:33:54"}
+{"epoch": 6, "train_loss": 0.7410576547895159, "val_loss": 0.5994277278582255, "avg_dets_per_img": 0.0, "lr": 5e-05, "epoch_seconds": 807.3974599838257, "timestamp": "2025-08-09 05:48:26"}
+{"epoch": 7, "train_loss": 0.6642589688301086, "val_loss": 0.5660495162010193, "avg_dets_per_img": 0.0, "lr": 5e-05, "epoch_seconds": 807.9723496437073, "timestamp": "2025-08-09 06:02:58"}
+{"epoch": 8, "train_loss": 0.6529916350330626, "val_loss": 0.5507150570551554, "avg_dets_per_img": 0.0, "lr": 5e-05, "epoch_seconds": 807.6669764518738, "timestamp": "2025-08-09 06:17:28"}
