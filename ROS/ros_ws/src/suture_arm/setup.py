@@ -10,8 +10,15 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (f'share/{package_name}/scenes', ['resource/ur3_suture.ttt']), 
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'ikpy',
+        'numpy',
+        'transforms3d',
+        'coppeliasim-zmqremoteapi-client',
+    ],
     zip_safe=True,
     maintainer='mscrobotics2425laptop37',
     maintainer_email='judebarakat@yahoo.com',
@@ -20,6 +27,7 @@ setup(
     #tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'suturing = suture_arm.suture_arm_node:main',
         ],
     },
 )
