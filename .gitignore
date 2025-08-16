@@ -3548,3 +3548,4 @@ ROS/ros_ws2/install/ur_description/share/ur_description/urdf/inc/ur_transmission
 ROS/ros_ws2/log/COLCON_IGNORE
 ROS/ros_ws2/log/latest
 ROS/ros_ws2/log/latest_build
+ROS/ros_ws2/install/suture_arm/share/suture_arm/urdf/mat.urdf.xacro

@@ -22,33 +22,50 @@ from ament_index_python.packages import get_package_share_directory
 try:
     from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 except ImportError:
-    # old import name fallback
-    from zmqRemoteApi import RemoteAPIClient
+    from zmqRemoteApi import RemoteAPIClient  # legacy fallback
 
 
 # ----------------- Config -----------------
-ROBOT = 'ur3'   # ur5 or ur5e; change URDF path below if needed
-ROBOT_BASE_PATH = '/UR3'  # CoppeliaSim object path of the robot base
+ROBOT = 'ur3'                # 'ur3', 'ur3e', 'ur5', 'ur5e', ...
+ROBOT_BASE_PATH = '/UR3'     # CoppeliaSim object path of the robot base
 JOINT_NAMES = [
     'shoulder_pan_joint',
     'shoulder_lift_joint',
-    'elbow_joint',
+    'elbow_joint',           # change to 'joint' if your scene uses that name
     'wrist_1_joint',
     'wrist_2_joint',
     'wrist_3_joint'
 ]
 
-MAT_FRAME_NAME = 'mat'       # logical frame name (used in your ML & transforms)
-BASE_FRAME_NAME = 'base_link'  # robot base frame (URDF base)
-TOOL_FRAME_NAME = 'tool0'    # UR DF tip frame (UR robots use tool0)
+MAT_FRAME_NAME  = 'mat'         # dummy or shape alias in your scene
+BASE_FRAME_NAME = 'base_link'   # URDF base
+TOOL_FRAME_NAME = 'tool0'       # UR tip
 
 # stitch params (meters)
 DEFAULT_SPACING = 0.006   # 6 mm between stitches
 DEFAULT_BITE    = 0.005   # 5 mm bite width (entry->exit offset)
 DEFAULT_DEPTH   = 0.003   # 3 mm z-depth below mat surface
-APPROACH_Z      = 0.012   # 12 mm above mat for approach/retract
+APPROACH_Z      = 0.012   # 12 mm approach/retract
 LINEAR_STEP     = 0.01    # rad step per joint when streaming to sim
-POSE_TOL        = 1e-3    # IK numeric tolerance
+POSE_TOL        = 1e-3
+N_PIERCE_PTS    = 7
+SINGULARITY_TILT = 0.20   # ~11.5°, small pitch to avoid straight-wrist singularity
+
+TWOPI = 2.0 * math.pi
+
+# Prefer an "elbow-up" comfortable posture (UR3-ish)
+NOMINAL_Q = np.array([0.0, -1.35, 1.90, 0.0, 1.30, 0.0])  # radians
+
+# Soft joint limits to keep safe configurations (adjust if needed)
+#          J1 (pan)      J2 (shoulder)  J3 (elbow)    J4 (wrist1)  J5 (wrist2)  J6 (wrist3)
+SOFT_LIMITS = np.array([
+    [-math.pi,  math.pi],     # [-180°, 180°]
+    [-2.60,     -0.10],       # keep shoulder down-ish
+    [ 0.00,      3.00],       # elbow mostly in front
+    [-2.50,      2.50],       # avoid extreme wrist1 bend
+    [ 0.25,      2.80],       # avoid straight wrist2 (~0) & extremes
+    [-math.pi,  math.pi],
+], dtype=float)
 # ------------------------------------------
 
 
@@ -74,58 +91,113 @@ def sample_polyline(poly: np.ndarray, spacing: float) -> np.ndarray:
     return resampled
 
 
-def plan_stitches_for_cut(polyline_mat: np.ndarray,
-                          spacing=DEFAULT_SPACING,
-                          bite=DEFAULT_BITE,
-                          depth=DEFAULT_DEPTH,
-                          approach=APPROACH_Z) -> List[List[Pose]]:
+def bezier_curve(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, n: int) -> List[np.ndarray]:
+    """Quadratic Bézier curve points from p0 → p2 with control p1."""
+    ts = np.linspace(0.0, 1.0, n)
+    return [((1 - t) ** 2) * p0 + 2 * (1 - t) * t * p1 + (t ** 2) * p2 for t in ts]
+
+
+def wrap_to_nearest(q_target: np.ndarray, q_ref: np.ndarray) -> np.ndarray:
+    """Add/subtract 2π to each joint so it is nearest to q_ref (prevents multi-turn spins)."""
+    q_out = q_target.copy()
+    for i in range(len(q_out)):
+        d = q_out[i] - q_ref[i]
+        d = (d + math.pi) % TWOPI - math.pi  # wrap to (-pi, pi]
+        q_out[i] = q_ref[i] + d
+    return q_out
+
+
+def clamp_soft_limits(q: np.ndarray) -> np.ndarray:
+    """Clamp joint angles to the configured soft limits."""
+    q = q.copy()
+    for i in range(6):
+        lo, hi = SOFT_LIMITS[i]
+        q[i] = min(max(q[i], lo), hi)
+    return q
+
+
+def blend_seed(q_seed: np.ndarray, alpha: float = 0.7) -> np.ndarray:
+    """Bias IK initial guess toward a nominal elbow-up posture."""
+    return alpha * q_seed + (1.0 - alpha) * NOMINAL_Q
+
+
+def plan_continuous_stitch(polyline_mat: np.ndarray,
+                           spacing=DEFAULT_SPACING,
+                           bite=DEFAULT_BITE,
+                           depth=DEFAULT_DEPTH,
+                           approach=APPROACH_Z,
+                           clearance=0.006,                # a bit more clearance helps
+                           n_pierce_pts=N_PIERCE_PTS) -> List[List[Pose]]:
     """
-    Given a 2D or 3D polyline in the mat frame, return a list of stitch 'segments'.
-    Each segment is [approach, entry, pierce_mid, exit, retract] poses.
-    Tool orientation: z-down, yaw tangent to the cut.
+    Continuous running suture: approach once, then for each stitch do
+    entry -> curved pierce -> exit -> small clearance hop -> next entry,
+    and a final retract at the end. Returns [ [Pose,...] ] (one long segment).
     """
     if polyline_mat.shape[1] == 2:
         poly = np.c_[polyline_mat, np.zeros(len(polyline_mat))]
     else:
         poly = polyline_mat.copy()
 
-    points = sample_polyline(poly[:, :2], spacing)  # 2D sampling for tangent
-    segs: List[List[Pose]] = []
+    pts2d = sample_polyline(poly[:, :2], spacing)
+    if len(pts2d) == 0:
+        return [[]]
 
-    for i, p in enumerate(points):
-        # tangent at p
+    path: List[Pose] = []
+    z_surface = 0.0
+
+    for i, p in enumerate(pts2d):
+        # tangent
         if i == 0:
-            t = points[min(1, len(points)-1)] - points[0]
-        elif i == len(points)-1:
-            t = points[-1] - points[-2]
+            t = pts2d[min(1, len(pts2d)-1)] - pts2d[0]
+        elif i == len(pts2d)-1:
+            t = pts2d[-1] - pts2d[-2]
         else:
-            t = points[i+1] - points[i-1]
+            t = pts2d[i+1] - pts2d[i-1]
         if np.linalg.norm(t) < 1e-9:
             continue
-        t = t / np.linalg.norm(t)
-        # normal to the cut in mat plane (rotate tangent by +90 deg)
+        t = t / (np.linalg.norm(t) + 1e-9)
         n = np.array([-t[1], t[0]])
+
         entry_xy = p + (bite/2.0) * n
         exit_xy  = p - (bite/2.0) * n
 
-        # base z on poly's z if provided, otherwise 0 (mat surface)
-        z_surface = np.interp(0, [0, 1], [0, 0])  # 0 for now
-        entry = np.array([entry_xy[0], entry_xy[1], z_surface - depth])
-        exitp = np.array([exit_xy[0],  exit_xy[1],  z_surface - depth])
-        approach_p = np.array([entry_xy[0], entry_xy[1], z_surface + approach])
-        retract_p  = np.array([exit_xy[0],  exit_xy[1],  z_surface + approach])
+        entry  = np.array([entry_xy[0], entry_xy[1], z_surface - depth])
+        exitp  = np.array([exit_xy[0],  exit_xy[1],  z_surface - depth])
+        appr   = np.array([entry_xy[0], entry_xy[1], z_surface + approach])
+        clearE = np.array([exit_xy[0],  exit_xy[1],  z_surface + clearance])
 
-        # orientation: z-down, yaw aligned with tangent
         yaw = math.atan2(t[1], t[0])
-        rpy = (math.pi, 0.0, yaw)  # roll 180° -> z-down (UR's tool z points out)
-        segs.append([
-            Pose(approach_p, rpy),
-            Pose(entry, rpy),
-            Pose((entry + exitp)/2.0, rpy),  # mid pierce (straight approx.)
-            Pose(exitp, rpy),
-            Pose(retract_p, rpy),
-        ])
-    return segs
+        rpy = (math.pi, -SINGULARITY_TILT, yaw)  # z-down with a small pitch tilt
+
+        # first stitch: approach once
+        if i == 0:
+            path.append(Pose(appr, rpy))
+
+        # curved pierce via quadratic Bézier
+        mid = 0.5 * (entry + exitp)
+        extra_down = max(0.5 * bite, 0.8 * depth)
+        ctrl = mid + np.array([0.0, 0.0, -extra_down])
+        for q in bezier_curve(entry, ctrl, exitp, n_pierce_pts):
+            path.append(Pose(q, rpy))
+
+        # small clearance hop after each exit (except last we'll retract higher)
+        if i < len(pts2d) - 1:
+            path.append(Pose(clearE, rpy))
+            # small lateral move at clearance height toward next entry
+            p_next = pts2d[i+1]
+            t_next = (pts2d[min(i+2, len(pts2d)-1)] - p) if i < len(pts2d)-2 else (p_next - p)
+            t_next = t_next / (np.linalg.norm(t_next) + 1e-9)
+            n_next = np.array([-t_next[1], t_next[0]])
+            next_entry_xy = p_next + (bite/2.0) * n_next
+            next_entry_clear = np.array([next_entry_xy[0], next_entry_xy[1], z_surface + clearance])
+            path.append(Pose(next_entry_clear, rpy))
+        else:
+            # last stitch: retract to approach height
+            retract = np.array([exit_xy[0], exit_xy[1], z_surface + approach])
+            path.append(Pose(retract, rpy))
+
+    # return as one long segment for execute()
+    return [path]
 
 
 def homogeneous_from_pose(p: Pose) -> np.ndarray:
@@ -135,22 +207,52 @@ def homogeneous_from_pose(p: Pose) -> np.ndarray:
     return T
 
 
+# ---------- Simple drawing helpers (overlay in CoppeliaSim) ----------
+def draw_reset(sim, handles: dict):
+    for h in list(handles.values()):
+        try:
+            sim.removeDrawingObject(h)
+        except Exception:
+            pass
+    handles.clear()
+
+def draw_cut_and_stitches(sim, base_handle, T_base_mat, polyline_mat: np.ndarray, poses: List[Pose], handles: dict):
+    """Draws: green line for cut, small red spheres for stitch samples."""
+    if 'cut' not in handles:
+        handles['cut'] = sim.addDrawingObject(sim.drawing_lines, 2.0, 0.0, base_handle, 10000, [0,1,0])
+    if 'pts' not in handles:
+        handles['pts'] = sim.addDrawingObject(sim.drawing_spherepoints, 0.006, 0.0, base_handle, 10000, [1,0,0])
+
+    def mat_to_base(p3):
+        p = np.r_[p3, 1.0]
+        q = (T_base_mat @ p)[:3]
+        return q.tolist()
+
+    # cut line
+    if polyline_mat.shape[1] == 2:
+        poly3 = np.c_[polyline_mat, np.zeros(len(polyline_mat))]
+    else:
+        poly3 = polyline_mat
+    for a, b in zip(poly3[:-1], poly3[1:]):
+        sim.addDrawingObjectItem(handles['cut'], mat_to_base(a) + mat_to_base(b))
+
+    # stitch points
+    for P in poses:
+        sim.addDrawingObjectItem(handles['pts'], P.xyz.tolist())
+# --------------------------------------------------------------------
+
+
 class IKUR:
     """
     Lightweight IK using UR description with ikpy.
     """
-
     def __init__(self, robot: str = 'ur3'):
         """
         Expand the UR xacro into URDF, patch 'continuous' joints so ikpy accepts them,
         and build an IK chain that exposes exactly the 6 UR joints (by name).
         """
-        import os, re, subprocess, numpy as np
-        from ament_index_python.packages import get_package_share_directory
-        from ikpy.chain import Chain
-        from ikpy.link import URDFLink
+        import re
 
-        # ---- xacro paths & args ----
         ur_desc = get_package_share_directory('ur_description')
         xacro_path = os.path.join(ur_desc, 'urdf', 'ur.urdf.xacro')
 
@@ -170,7 +272,6 @@ class IKUR:
             f'visual_params:={os.path.join(cfg_dir, "visual_parameters.yaml")}',
         ]
 
-        # ---- expand xacro ----
         urdf_xml = subprocess.check_output(xacro_cmd)
 
         # ---- patch for ikpy ----
@@ -193,15 +294,12 @@ class IKUR:
         with open(tmp_urdf, 'w') as f:
             f.write(txt)
 
-        # ---- build chain ----
         self.chain = Chain.from_urdf_file(
             tmp_urdf,
             base_elements=[BASE_FRAME_NAME],
             active_links_mask=None
         )
 
-        # ---- select exactly the 6 UR joints by name ----
-        # These names must match the URDF joint names (they do for UR family)
         target_joint_names = [
             'shoulder_pan_joint',
             'shoulder_lift_joint',
@@ -220,24 +318,33 @@ class IKUR:
                                + f"\nAvailable links were: {link_names}")
 
         self.active_idx = [name_to_idx[n] for n in target_joint_names]
-
-        # Warm-start vector for IK
-        self.q = np.zeros(len(self.chain.links))
+        self.q = np.zeros(len(self.chain.links))  # warm-start vector
 
     def solve(self, target_T: np.ndarray, q_seed: np.ndarray = None) -> np.ndarray:
-        if q_seed is not None:
-            # map seed into full vector
-            q_full = self.q.copy()
-            for k, idx in enumerate(self.active_idx):
-                q_full[idx] = q_seed[k]
-        else:
-            q_full = self.q.copy()
+        # initial guess: blend last command with a nominal elbow-up posture
+        if q_seed is None:
+            q_seed = NOMINAL_Q
+        q_init_full = self.q.copy()
+        for k, idx in enumerate(self.active_idx):
+            q_init_full[idx] = blend_seed(q_seed)[k]
 
-        q_sol = self.chain.inverse_kinematics_frame(
-            target_T, initial_position=q_full, orientation_mode='all')  # 6D IK
-        # extract 6 joint angles in the same order we detected as active links
-        q6 = np.array([q_sol[idx] for idx in self.active_idx])
-        # store back to full for warm starting next iteration
+        # 1) Try strict 6D orientation
+        try:
+            q_sol_all = self.chain.inverse_kinematics_frame(
+                target_T, initial_position=q_init_full, orientation_mode='all')
+            q6 = np.array([q_sol_all[idx] for idx in self.active_idx])
+            q6 = clamp_soft_limits(q6)
+            for k, idx in enumerate(self.active_idx):
+                self.q[idx] = q6[k]
+            return q6
+        except Exception:
+            pass
+
+        # 2) Fallback: align only tool Z (lets yaw/roll vary if needed)
+        q_sol_z = self.chain.inverse_kinematics_frame(
+            target_T, initial_position=q_init_full, orientation_mode='z')
+        q6 = np.array([q_sol_z[idx] for idx in self.active_idx])
+        q6 = clamp_soft_limits(q6)
         for k, idx in enumerate(self.active_idx):
             self.q[idx] = q6[k]
         return q6
@@ -248,53 +355,46 @@ class CoppeliaDriver:
         self.client = RemoteAPIClient()
         self.sim = self.client.require('sim')
 
-        # # Start the simulation if stopped and enable stepped mode
-        # try:
-        #     if hasattr(self.sim, 'setStepping'):
-        #         self.sim.setStepping(True)
-        #     state = self.sim.getSimulationState()
-        #     if state == self.sim.simulation_stopped:
-        #         self.sim.startSimulation()
-        # except Exception as e:
-        #     print('[WARN] Could not auto-start simulation:', e)
-
-
-
-        # Stepped mode (deterministic stepping)
+        # Stepped mode + make sure the sim is running
         if hasattr(self.sim, 'setStepping'):
             self.sim.setStepping(True)
+        try:
+            state = self.sim.getSimulationState()
+            if state in (self.sim.simulation_stopped, self.sim.simulation_paused):
+                self.sim.startSimulation()
+        except Exception as e:
+            print('[WARN] Could not auto-start simulation:', e)
 
         # ---- Resolve base handle robustly ----
         base_candidates = [robot_base_path]
         if not robot_base_path.endswith('#0'):
             base_candidates.append(robot_base_path + '#0')
-        # also try plain alias (without leading '/')
         if robot_base_path.startswith('/'):
             base_candidates.append(robot_base_path[1:])
 
-        base_handle = None
+        self.base_handle = None
+        self.robot_path_used = None
         last_err = None
         for cand in base_candidates:
             try:
-                base_handle = self.sim.getObject(cand)
-                ROBOT_PATH_USED = cand
+                self.base_handle = self.sim.getObject(cand)
+                self.robot_path_used = cand
                 break
             except Exception as e:
                 last_err = e
-        if base_handle is None:
+        if self.base_handle is None:
             raise RuntimeError(
                 f"Could not find robot base at any of: {base_candidates}. "
                 f"Rename your root object in Coppelia or update ROBOT_BASE_PATH. "
                 f"Last error: {last_err}"
             )
 
-        # ---- Resolve joints (try absolute path first, then global alias) ----
+        # ---- Resolve joints ----
         self.joint_handles = []
         missing = []
         for jn in joint_names:
             h = None
-            # try as child path of the base
-            for cand in (f'{ROBOT_PATH_USED}/{jn}', jn):
+            for cand in (f'{self.robot_path_used}/{jn}', jn):
                 try:
                     h = self.sim.getObject(cand)
                     break
@@ -306,10 +406,9 @@ class CoppeliaDriver:
                 self.joint_handles.append(h)
 
         if missing:
-            # Try to help: list all joints under the base so you can see actual names
             try:
-                JOINT = getattr(self.sim, 'object_joint_type', 2)  # fallback enum value
-                under_base = self.sim.getObjectsInTree(base_handle, JOINT, 1)  # include base's children
+                JOINT = getattr(self.sim, 'object_joint_type', 2)
+                under_base = self.sim.getObjectsInTree(self.base_handle, JOINT, 1)
                 aliases = [self.sim.getObjectAlias(h, 1) for h in under_base]
             except Exception:
                 aliases = ['(could not query aliases)']
@@ -317,14 +416,14 @@ class CoppeliaDriver:
             raise RuntimeError(
                 "Could not find these joint(s): "
                 + ", ".join(missing)
-                + f"\nLook under robot base '{ROBOT_PATH_USED}' and rename them to match, or update JOINT_NAMES.\n"
+                + f"\nLook under robot base '{self.robot_path_used}' and rename them to match, or update JOINT_NAMES.\n"
                 + "Joints found under the base were:\n  - "
                 + "\n  - ".join(aliases)
             )
 
         # Optional tool joint
         try:
-            self.tool_handle = self.sim.getObject(f'{ROBOT_PATH_USED}/tool_opening_joint')
+            self.tool_handle = self.sim.getObject(f'{self.robot_path_used}/tool_opening_joint')
         except Exception:
             try:
                 self.tool_handle = self.sim.getObject('tool_opening_joint')
@@ -340,6 +439,10 @@ class CoppeliaDriver:
 
     def goto(self, q_target: np.ndarray, step=LINEAR_STEP, settle_time=0.05):
         q_curr = self.get_joints()
+        # shortest-path + soft limits
+        q_target = wrap_to_nearest(q_target, q_curr)
+        q_target = clamp_soft_limits(q_target)
+
         delta = q_target - q_curr
         steps = max(1, int(np.max(np.abs(delta)) / step))
         for s in range(1, steps + 1):
@@ -348,6 +451,7 @@ class CoppeliaDriver:
                 self.sim.setJointTargetPosition(h, float(qi))
             self.sim.step()
         time.sleep(settle_time)
+
 
 class SutureNode(Node):
     """
@@ -359,6 +463,31 @@ class SutureNode(Node):
         self.sub = self.create_subscription(String, '/suture_cuts', self.on_cuts, 10)
         self.ik = IKUR(ROBOT)
         self.driver = CoppeliaDriver(JOINT_NAMES, ROBOT_BASE_PATH)
+
+        # --- Calibrate T_base_mat from the scene (mat relative to robot base) ---
+        self.T_base_mat = np.eye(4)
+        try:
+            mat_candidates = [f'/{MAT_FRAME_NAME}', MAT_FRAME_NAME, f'/{MAT_FRAME_NAME}#0']
+            mat_h = None
+            for cand in mat_candidates:
+                try:
+                    mat_h = self.driver.sim.getObject(cand)
+                    break
+                except Exception:
+                    pass
+            if mat_h is None:
+                self.get_logger().warn(f"Mat '{MAT_FRAME_NAME}' not found. Using identity T_base_mat.")
+            else:
+                pos = self.driver.sim.getObjectPosition(mat_h, self.driver.base_handle)     # [x,y,z]
+                rpy = self.driver.sim.getObjectOrientation(mat_h, self.driver.base_handle)  # [roll,pitch,yaw]
+                R = tft.euler_matrix(*rpy)[:3, :3]
+                self.T_base_mat[:3, :3] = R
+                self.T_base_mat[:3,  3] = np.array(pos)
+                self.get_logger().info(f"T_base_mat set from scene. pos={pos}, rpy={rpy}")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to compute T_base_mat from scene: {e}. Using identity.")
+
+        self._draw = {}  # drawing object handles
         self.get_logger().info('SutureNode ready. Waiting for /suture_cuts ...')
 
     def on_cuts(self, msg: String):
@@ -377,31 +506,40 @@ class SutureNode(Node):
         bite    = data.get('params', {}).get('bite',    DEFAULT_BITE)
         depth   = data.get('params', {}).get('depth',   DEFAULT_DEPTH)
 
-        # For simplicity assume mat frame == robot base XY plane at z=0.
-        # If you have a calibrated transform T_base_mat, apply it here to lift poses into base_link.
-        T_base_mat = np.eye(4)
+        self.get_logger().info(f"Got /suture_cuts: {len(data.get('cuts', []))} cut(s) "
+                               f"(spacing={spacing:.3f}, bite={bite:.3f}, depth={depth:.3f})")
 
         for cut in data['cuts']:
             poly = np.array(cut['polyline'], dtype=float)  # Nx2 or Nx3 in meters
-            segments = plan_stitches_for_cut(poly, spacing, bite, depth, approach=APPROACH_Z)
-            self.execute_segments(segments, T_base_mat)
+            segments = plan_continuous_stitch(
+                poly, spacing, bite, depth, approach=APPROACH_Z, clearance=0.006
+            )
+            all_poses = [p for seg in segments for p in seg]
+
+            # draw overlays (cut + planned path points)
+            draw_reset(self.driver.sim, self._draw)
+            draw_cut_and_stitches(self.driver.sim, self.driver.base_handle, self.T_base_mat, poly, all_poses, self._draw)
+
+            self.get_logger().info(f"Planned {len(all_poses)} poses for this cut")
+            self.execute_segments(segments)
 
         self.get_logger().info('Finished suturing all cuts.')
 
-    def execute_segments(self, segments: List[List[Pose]], T_base_mat: np.ndarray):
+    def execute_segments(self, segments: List[List[Pose]]):
         q_seed = self.driver.get_joints()
-        # slight tool open (if present)
-        self.driver.set_tool(0.0)
+        self.driver.set_tool(0.02)  # slightly open (if present)
 
         for seg in segments:
             for pose in seg:
-                # Lift pose from mat frame into base_link
-                T = T_base_mat @ homogeneous_from_pose(pose)
+                T = self.T_base_mat @ homogeneous_from_pose(pose)  # lift from mat to base_link
                 q_target = self.ik.solve(T, q_seed)
+                # keep near previous branch + within soft limits
+                q_target = wrap_to_nearest(q_target, q_seed)
+                q_target = clamp_soft_limits(q_target)
                 self.driver.goto(q_target)
                 q_seed = q_target.copy()
-        # retract tool a bit open/close if you want
-        self.driver.set_tool(0.0)
+
+        self.driver.set_tool(0.02)  # open at the end (if present)
 
 
 def main():
