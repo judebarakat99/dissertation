@@ -3554,3 +3554,9 @@ ROS/ros_ws2/src/suture_arm/ML_detection/cuts_detector_best2.pth
 ROS/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector.pth
 ROS/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector2.pth
 ROS/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector3.pth
+ROS/ros_ws2/install/suture_arm/share/suture_arm/launch/suture_demo.launch.py
+ROS/ros_ws2/install/suture_arm/share/suture_arm/ml/cuts_detector_best.pth
+ROS/ros_ws2/install/suture_arm/share/suture_arm/ml/cuts_detector_best2.pth
+ROS/ros_ws2/install/suture_arm/share/suture_arm/ml/mask_cuts_detector.pth
+ROS/ros_ws2/install/suture_arm/share/suture_arm/ml/mask_cuts_detector2.pth
+ROS/ros_ws2/install/suture_arm/share/suture_arm/ml/mask_cuts_detector3.pth
