@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import json
 import math
@@ -13,7 +14,6 @@ import tf_transformations as tft
 
 # IK
 from ikpy.chain import Chain
-from ikpy.link import URDFLink
 # xacro/URDF
 import subprocess
 from ament_index_python.packages import get_package_share_directory
@@ -31,21 +31,21 @@ ROBOT_BASE_PATH = '/UR3'     # CoppeliaSim object path of the robot base
 JOINT_NAMES = [
     'shoulder_pan_joint',
     'shoulder_lift_joint',
-    'elbow_joint',           # change to 'joint' if your scene uses that name
+    'elbow_joint',           # you said you've renamed it to elbow_joint
     'wrist_1_joint',
     'wrist_2_joint',
     'wrist_3_joint'
 ]
 
 MAT_FRAME_NAME  = 'mat'         # dummy or shape alias in your scene
-BASE_FRAME_NAME = 'base_link'   # URDF base
-TOOL_FRAME_NAME = 'tool0'       # UR tip
+BASE_FRAME_NAME = 'base_link'   # URDF base link
+TOOL_FRAME_NAME = 'tool0'       # UR tool frame
 
 # stitch params (meters)
 DEFAULT_SPACING = 0.006   # 6 mm between stitches
-DEFAULT_BITE    = 0.005   # 5 mm bite width (entry->exit offset)
+DEFAULT_BITE    = 0.005   # 5 mm bite width (entry->exit offset across cut)
 DEFAULT_DEPTH   = 0.003   # 3 mm z-depth below mat surface
-APPROACH_Z      = 0.012   # 12 mm approach/retract
+APPROACH_Z      = 0.012   # 12 mm approach/retract height
 LINEAR_STEP     = 0.01    # rad step per joint when streaming to sim
 POSE_TOL        = 1e-3
 N_PIERCE_PTS    = 7
@@ -53,17 +53,17 @@ SINGULARITY_TILT = 0.20   # ~11.5°, small pitch to avoid straight-wrist singula
 
 TWOPI = 2.0 * math.pi
 
-# Prefer an "elbow-up" comfortable posture (UR3-ish)
+# Prefer an "elbow-up" comfortable posture (UR3-ish) for IK seeding
 NOMINAL_Q = np.array([0.0, -1.35, 1.90, 0.0, 1.30, 0.0])  # radians
 
 # Soft joint limits to keep safe configurations (adjust if needed)
 #          J1 (pan)      J2 (shoulder)  J3 (elbow)    J4 (wrist1)  J5 (wrist2)  J6 (wrist3)
 SOFT_LIMITS = np.array([
-    [-math.pi,  math.pi],     # [-180°, 180°]
-    [-2.60,     -0.10],       # keep shoulder down-ish
-    [ 0.00,      3.00],       # elbow mostly in front
-    [-2.50,      2.50],       # avoid extreme wrist1 bend
-    [ 0.25,      2.80],       # avoid straight wrist2 (~0) & extremes
+    [-math.pi,  math.pi],   # [-180°, 180°]
+    [-2.60,     -0.10],     # keep shoulder down-ish
+    [ 0.00,      3.00],     # elbow mostly in front
+    [-2.50,      2.50],     # avoid extreme wrist1 bend
+    [ 0.25,      2.80],     # avoid straight wrist2 (~0) & extremes
     [-math.pi,  math.pi],
 ], dtype=float)
 # ------------------------------------------
@@ -126,7 +126,7 @@ def plan_continuous_stitch(polyline_mat: np.ndarray,
                            bite=DEFAULT_BITE,
                            depth=DEFAULT_DEPTH,
                            approach=APPROACH_Z,
-                           clearance=0.006,                # a bit more clearance helps
+                           clearance=0.006,
                            n_pierce_pts=N_PIERCE_PTS) -> List[List[Pose]]:
     """
     Continuous running suture: approach once, then for each stitch do

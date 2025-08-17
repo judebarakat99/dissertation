@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (f'share/{package_name}/scenes', ['resource/ur3_suture.ttt']), 
-        (f'share/{package_name}/urdf',   ['urdf/mat.urdf.xacro']), 
+        #(f'share/{package_name}/urdf',   ['urdf/mat.urdf.xacro']), 
     ],
     install_requires=[
         'setuptools',
