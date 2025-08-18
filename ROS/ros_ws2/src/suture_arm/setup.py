@@ -10,6 +10,14 @@ model_files = [
     'ML_detection/mask_cuts_detector3.pth',
 ]
 
+ml_files = [
+    'ML_detection/cuts_detector_best.py',
+    'ML_detection/cuts_detector_best2.py',
+    'ML_detection/mask_cuts_detector.py',
+    'ML_detection/mask_cuts_detector2.py',
+    'ML_detection/mask_cuts_detector3.py',
+]
+
 setup(
     name=package_name,
     version='0.0.0',
@@ -22,6 +30,7 @@ setup(
         (f'share/{package_name}/launch', ['launch/suture_demo.launch.py']),
         #(f'share/{package_name}/urdf',   ['urdf/mat.urdf.xacro']), 
         (f'share/{package_name}/ml', model_files),  
+        (f'share/{package_name}/ml', ml_files),
     ],
     install_requires=[
         'setuptools',
@@ -40,7 +49,7 @@ setup(
         'console_scripts': [
             'suturing = suture_arm.suture_arm_node:main',
             'vision_web = suture_arm.vision_web:main', 
-            'coppelia_run = suture_arm.coppelia_runner:main',   # <-- NEW
+            'coppelia_run = suture_arm.coppelia_runner:main',   
         ],
     },
 )
