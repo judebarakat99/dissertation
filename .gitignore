@@ -4605,3 +4605,4 @@ datasets/simulation_coco/valid/frame_000141_jpg.rf.bc943342e8c701af5703c932553a8
 datasets/simulation_coco/valid/frame_000162_jpg.rf.05fc90872ab02cae350c750fda8b4936.jpg
 datasets/simulation_coco/valid/frame_000182_jpg.rf.e815d8b49799af0a3e030771a7bfa146.jpg
 datasets/simulation_coco/valid/frame_000191_jpg.rf.e4d6e3c593377e0e4a208a1b725b291b.jpg
+ML_codes/simulation_ML/cuts_detector_best.pth
