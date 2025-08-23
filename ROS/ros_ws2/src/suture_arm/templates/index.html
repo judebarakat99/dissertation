@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>CoppeliaSim Vision</title>
+  <style>
+    :root { --gap: 14px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 16px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#fafafa; color:#222; }
+    h1 { font-size: 20px; margin: 0 0 6px; }
+    .meta { color:#666; font-size:14px; margin-bottom: 14px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: var(--gap);
+      align-items: start;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e6e6e6;
+      border-radius: 10px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.06);
+      overflow: hidden;
+    }
+    .card header {
+      padding: 10px 12px;
+      border-bottom: 1px solid #eee;
+      display: flex; align-items: baseline; gap: 8px;
+    }
+    .card header h3 {
+      font-size: 16px; font-weight: 600; margin: 0;
+    }
+    .card header .sub {
+      color:#777; font-size: 12px;
+    }
+    .frame {
+      display:block;
+      width: 100%;
+      aspect-ratio: 4/3;      /* keeps panels consistent if streams differ */
+      background: #000;
+      object-fit: contain;     /* no stretching; letterbox if needed */
+    }
+    .note {
+      margin-top: 4px; color:#888; font-size: 12px;
+    }
+
+    /* Optional: make two big columns (≈40% each) on really wide screens */
+    @media (min-width: 1400px) {
+      .grid { grid-template-columns: repeat(2, minmax(520px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <h1>CoppeliaSim vision streams</h1>
+  <div class="meta">
+    Sensor: <b>{{ sensor }}</b> &nbsp;•&nbsp; ZMQ: <b>{{ host }}:{{ port }}</b>
+  </div>
+
+  <div class="grid">
+    <!-- RAW stream -->
+    <div class="card">
+      <header>
+        <h3>Raw</h3>
+        <span class="sub">/stream_raw</span>
+      </header>
+      <img class="frame" src="/stream_raw" alt="Raw vision stream"/>
+    </div>
+
+    <!-- Overlays (each in its own card) -->
+    {% for m in loaded_models %}
+      <div class="card">
+        <header>
+          <h3>{{ m }}</h3>
+          <span class="sub">/stream_model/{{ m }}</span>
+        </header>
+        <img class="frame" src="/stream_model/{{ m }}" alt="{{ m }} overlay stream"/>
+      </div>
+    {% endfor %}
+  </div>
+
+  {% if not loaded_models or loaded_models|length == 0 %}
+    <p class="note">No models loaded. Ensure your <code>*.py</code> wrappers and <code>*.pth</code> files are in
+      <code>share/suture_arm/ml</code> (installed) or <code>src/suture_arm/ML_detection</code> (source).</p>
+  {% endif %}
+</body>
+</html>

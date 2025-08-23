@@ -31,6 +31,7 @@ setup(
         #(f'share/{package_name}/urdf',   ['urdf/mat.urdf.xacro']), 
         (f'share/{package_name}/ml', model_files),  
         (f'share/{package_name}/ml', ml_files),
+        ('share/' + package_name + '/templates', ['templates/index.html']),
     ],
     install_requires=[
         'setuptools',
@@ -50,6 +51,9 @@ setup(
             'suturing = suture_arm.suture_arm_node:main',
             'vision_web = suture_arm.vision_web:main', 
             'coppelia_run = suture_arm.coppelia_runner:main',   
+            'dataset_capture = suture_arm.dataset_capture:main', 
+            'dataset_capture2 = suture_arm.dataset_capture2:main', 
+
         ],
     },
 )

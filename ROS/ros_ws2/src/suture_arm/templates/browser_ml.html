@@ -1,0 +1,334 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Browser ML — UR3 Vision</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:14px}
+    .meta{color:#666;margin-bottom:10px}
+    .wrap{display:flex;flex-wrap:wrap;gap:16px}
+    .tile{border:1px solid #e5e5e5;border-radius:12px;padding:10px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+    .tile h3{margin:4px 0 8px 0;font-weight:600}
+    .pane{position:relative}
+    .pane canvas, .pane img{display:block;border-radius:8px;border:1px solid #ddd}
+    .pane canvas.overlay{position:absolute;left:0;top:0}
+    .note{color:#888;font-size:12px;margin-top:6px}
+    .controls{margin:8px 0 14px 0}
+    .controls label{margin-right:20px}
+    img.preview{width:40vw;max-width:1000px;height:auto}
+    canvas.preview{width:40vw;max-width:1000px;height:auto}
+    .err{color:#b00}
+  </style>
+  <!-- OpenCV.js for browser-side CV fallback (Canny+Hough) -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <!-- ONNX Runtime Web for browser-side ML (optional) -->
+  <script async src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body>
+  <h2>Browser ML — UR3 Vision</h2>
+  <div class="meta">
+    Sensor <code>{{sensor}}</code> • Mat <code>{{mat}}</code> • Snapshot from server • Processed in your browser
+  </div>
+
+  <div class="controls">
+    <label><input type="checkbox" id="cvToggle" checked> Enable CV fallback (Canny + Hough)</label>
+    <label><input type="checkbox" id="mlToggle"> Enable ONNX models</label>
+    <label>Rate: <select id="rate">
+      <option value="2">2 FPS</option>
+      <option value="4" selected>4 FPS</option>
+      <option value="6">6 FPS</option>
+      <option value="8">8 FPS</option>
+    </select></label>
+    <button id="snap">Snapshot now</button>
+    <span id="status" class="note"></span>
+  </div>
+
+  <div class="wrap" id="tiles">
+    <!-- Tiles are created by JS using the MODEL_LIST embedded below -->
+  </div>
+
+  <script>
+    // Model list comes from Flask:
+    const MODEL_LIST = {{ models|tojson|safe }};  // stems, e.g. ["mask_cuts_detector","cuts_detector_best",...]
+
+    // Endpoints from the server:
+    const SNAP_URL = "/snapshot/raw.jpg";   // we poll this for fresh frames
+
+    // Build the layout:
+    const tilesEl = document.getElementById('tiles');
+    const makeTile = (title, idPrefix) => {
+      const div = document.createElement('div');
+      div.className = 'tile';
+      div.innerHTML = `
+        <h3>${title}</h3>
+        <div class="pane">
+          <img id="${idPrefix}-img" class="preview" alt="${title}">
+          <canvas id="${idPrefix}-ov" class="overlay"></canvas>
+        </div>
+        <div class="note" id="${idPrefix}-note"></div>
+      `;
+      tilesEl.appendChild(div);
+      return {
+        img:  div.querySelector(`#${idPrefix}-img`),
+        ov:   div.querySelector(`#${idPrefix}-ov`),
+        note: div.querySelector(`#${idPrefix}-note`),
+        title
+      };
+    };
+
+    const rawTile = makeTile('Raw (browser)', 'raw');
+    const cvTile  = makeTile('CV Fallback (browser)', 'cv');
+    const mlTiles = MODEL_LIST.map(stem => makeTile(`ONNX: ${stem}`, `ml-${stem}`));
+
+    const $cv = document.getElementById('cvToggle');
+    const $ml = document.getElementById('mlToggle');
+    const $rate = document.getElementById('rate');
+    const $snap = document.getElementById('snap');
+    const $status = document.getElementById('status');
+
+    // Utility: fetch snapshot into an ImageBitmap (fast decode)
+    async function fetchFrame() {
+      const resp = await fetch(SNAP_URL + '?ts=' + Date.now(), {cache:'no-store'});
+      if (!resp.ok) throw new Error('snapshot HTTP ' + resp.status);
+      const blob = await resp.blob();
+      return await createImageBitmap(blob);
+    }
+
+    // Draw an ImageBitmap into <img> + scale overlay canvas to same size
+    function showFrame(tile, bitmap) {
+      // Draw to an offscreen canvas to get pixels & size:
+      const c = document.createElement('canvas');
+      c.width = bitmap.width;
+      c.height = bitmap.height;
+      const cx = c.getContext('2d');
+      cx.drawImage(bitmap, 0, 0);
+      // update <img> element:
+      tile.img.src = c.toDataURL('image/jpeg', 0.92);
+      // size the overlay canvas to the displayed <img> size after CSS layout
+      // (we wait a tick to let layout compute)
+      setTimeout(() => {
+        const w = tile.img.clientWidth;
+        const h = tile.img.clientHeight;
+        tile.ov.width = w;
+        tile.ov.height = h;
+      }, 0);
+      return c; // return the source canvas containing pixels
+    }
+
+    // -------- CV Fallback (OpenCV.js): detect main cut via Canny + Hough --------
+    function cvDetect(canvasSrc, tile) {
+      if (typeof cv === 'undefined' || !cv || !cv.Mat) {
+        tile.note.textContent = 'OpenCV.js not loaded yet';
+        return;
+      }
+      try {
+        const w = canvasSrc.width, h = canvasSrc.height;
+        const mat = cv.imread(canvasSrc);
+        const gray = new cv.Mat(); cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY, 0);
+        const blur = new cv.Mat(); cv.GaussianBlur(gray, blur, new cv.Size(5,5), 0, 0, cv.BORDER_DEFAULT);
+        const edges = new cv.Mat(); cv.Canny(blur, edges, 60, 180, 3, false);
+
+        const lines = new cv.Mat();
+        cv.HoughLinesP(edges, lines, 1, Math.PI/180, Math.max(60, Math.min(w,h)/8), Math.max(40, Math.min(w,h)/4), Math.max(10, Math.min(w,h)/20));
+
+        // draw the longest line in overlay canvas coordinates
+        const ctx = tile.ov.getContext('2d');
+        ctx.clearRect(0,0,tile.ov.width,tile.ov.height);
+        ctx.lineWidth = Math.max(2, Math.round(tile.ov.height/300));
+        ctx.strokeStyle = 'rgb(60, 220, 60)';
+        if (lines.rows > 0) {
+          let best = null, bestL = -1;
+          for (let i=0;i<lines.rows;i++){
+            const x1 = lines.data32S[i*4+0], y1 = lines.data32S[i*4+1];
+            const x2 = lines.data32S[i*4+2], y2 = lines.data32S[i*4+3];
+            const L = (x2-x1)**2 + (y2-y1)**2;
+            if (L>bestL) { bestL=L; best=[x1,y1,x2,y2]; }
+          }
+          if (best) {
+            // scale from source canvas to displayed size:
+            const sx = tile.ov.width / w;
+            const sy = tile.ov.height / h;
+            ctx.beginPath();
+            ctx.moveTo(best[0]*sx, best[1]*sy);
+            ctx.lineTo(best[2]*sx, best[3]*sy);
+            ctx.stroke();
+            tile.note.textContent = `Detected line: [${best.join(', ')}]`;
+          } else {
+            tile.note.textContent = 'No lines found';
+          }
+        } else {
+          tile.note.textContent = 'No lines found';
+        }
+
+        // cleanup
+        mat.delete(); gray.delete(); blur.delete(); edges.delete(); lines.delete();
+      } catch (e) {
+        tile.note.textContent = 'CV error: ' + e.message;
+      }
+    }
+
+    // -------- ONNX Runtime Web: load each model and run inference on the frame --------
+    // We assume your .onnx files live under /static/models/<stem>.onnx
+    // and (optionally) /static/models/<stem>.json for calib/settings per model.
+    const onnx = {
+      sessions: {},  // stem -> ort.InferenceSession
+      calibs:   {},  // stem -> json
+    };
+
+    async function loadOnnx(stem) {
+      if (onnx.sessions[stem]) return;
+      const modelUrl = `/static/models/${stem}.onnx`;
+      try {
+        onnx.sessions[stem] = await ort.InferenceSession.create(modelUrl, {
+          executionProviders: ['wasm'],
+          graphOptimizationLevel: 'all'
+        });
+      } catch (e) {
+        console.warn('ONNX load failed for', stem, e);
+      }
+      // load calib if present
+      try {
+        const r = await fetch(`/static/models/${stem}.json`);
+        if (r.ok) onnx.calibs[stem] = await r.json();
+      } catch {}
+    }
+
+    // Simple image -> tensor helper (NHWC -> NCHW float32 0..1)
+    function imageToTensor(canvasSrc, size) {
+      const w = canvasSrc.width, h = canvasSrc.height;
+      const ctx = canvasSrc.getContext('2d');
+      const imgData = ctx.getImageData(0, 0, w, h).data; // RGBA
+      // If model needs a specific size, resize on a tmp canvas:
+      let src = canvasSrc;
+      if (size && size[0] && size[1]) {
+        const [tw, th] = size;
+        const tmp = document.createElement('canvas'); tmp.width=tw; tmp.height=th;
+        tmp.getContext('2d').drawImage(canvasSrc, 0,0, w,h, 0,0, tw,th);
+        src = tmp;
+      }
+      const ctx2 = src.getContext('2d');
+      const d = ctx2.getImageData(0,0,src.width,src.height).data;
+      const N = src.width * src.height;
+      const r = new Float32Array(N), g = new Float32Array(N), b = new Float32Array(N);
+      for (let i=0, j=0;i<N;i++,j+=4){ r[i]=d[j]/255; g[i]=d[j+1]/255; b[i]=d[j+2]/255; }
+      // NCHW
+      return new ort.Tensor('float32',
+        new Float32Array([...r, ...g, ...b]),
+        [1, 3, src.width, src.height]
+      );
+    }
+
+    async function runOnnxOnTile(stem, srcCanvas, tile) {
+      try {
+        await loadOnnx(stem);
+        const sess = onnx.sessions[stem];
+        if (!sess) { tile.note.textContent = 'Model not loaded'; return; }
+
+        // If your model needs a fixed input size, set it here:
+        // const x = imageToTensor(srcCanvas, [320, 320]);
+        const x = imageToTensor(srcCanvas); // use original size
+
+        const feeds = {};
+        // Assume single input:
+        const inputName = sess.inputNames[0];
+        feeds[inputName] = x;
+        const out = await sess.run(feeds);
+        // Heuristic: pick the first output, expect HxW mask:
+        const firstKey = sess.outputNames[0];
+        let arr = out[firstKey].data;
+        // Try to interpret as [1,1,H,W] or [1,H,W] or [H,W]
+        let H = srcCanvas.height, W = srcCanvas.width;
+        if (out[firstKey].dims && out[firstKey].dims.length >= 2) {
+          const dims = out[firstKey].dims.slice(-2);
+          H = dims[0]; W = dims[1];
+        }
+        const mask = new Float32Array(arr.length);
+        for (let i=0;i<arr.length;i++) mask[i]=arr[i];
+
+        // Convert to ImageData-like gray mask and do Hough in 2D canvas space (no calib here):
+        // Normalize + threshold
+        let min=+1e9, max=-1e9; for (let v of mask){ if(v<min)min=v; if(v>max)max=v; }
+        const thr = min + 0.5*(max-min);
+        // Draw over the overlay canvas using a simple Hough (re-using CV is heavy; for now,
+        // we’ll rely on the CV fallback, but we can just show a green bbox/line if needed).
+        const ctx = tile.ov.getContext('2d');
+        ctx.clearRect(0,0,tile.ov.width,tile.ov.height);
+        ctx.lineWidth = Math.max(2, Math.round(tile.ov.height/300));
+        ctx.strokeStyle = 'rgb(60,220,60)';
+        // Simple visualization: outline the mask bounding box (if any positive pixels)
+        let xmin=W, xmax=0, ymin=H, ymax=0, cnt=0;
+        for (let y=0;y<H;y++){
+          for (let x2=0;x2<W;x2++){
+            const v = mask[y*W + x2];
+            if (v > thr){ cnt++; if(x2<xmin) xmin=x2; if(x2>xmax) xmax=x2; if(y<ymin) ymin=y; if(y>ymax) ymax=y; }
+          }
+        }
+        if (cnt>0){
+          const sx = tile.ov.width  / srcCanvas.width;
+          const sy = tile.ov.height / srcCanvas.height;
+          ctx.strokeRect(xmin*sx, ymin*sy, (xmax-xmin)*sx, (ymax-ymin)*sy);
+          tile.note.textContent = `ONNX ok: ${stem} (pos px=${cnt})`;
+        } else {
+          tile.note.textContent = `ONNX ok: ${stem} (no foreground)`;
+        }
+      } catch (e) {
+        tile.note.textContent = 'ONNX error: ' + e.message;
+      }
+    }
+
+    // -------- Main loop --------
+    let timer = null;
+    function startLoop() {
+      if (timer) clearInterval(timer);
+      const hz = parseInt($rate.value, 10);
+      const dt = Math.max(125, Math.round(1000/Math.max(1,hz))); // ms
+      timer = setInterval(async () => {
+        try {
+          const bmp = await fetchFrame();
+          const srcCanvas = showFrame(rawTile, bmp);
+          // Mirror to other tiles:
+          showFrame(cvTile, bmp);
+          mlTiles.forEach(t => showFrame(t, bmp));
+
+          if ($cv.checked) cvDetect(srcCanvas, cvTile);
+          if ($ml.checked) {
+            for (const t of mlTiles) {
+              const stem = t.title.replace(/^ONNX:\s*/,'');
+              runOnnxOnTile(stem, srcCanvas, t);
+            }
+          }
+          $status.textContent = '';
+        } catch (e) {
+          $status.textContent = 'Fetch error: ' + e.message;
+        }
+      }, dt);
+    }
+
+    $rate.addEventListener('change', startLoop);
+    $snap.addEventListener('click', async () => {
+      try {
+        const bmp = await fetchFrame();
+        showFrame(rawTile, bmp);
+        showFrame(cvTile, bmp);
+        mlTiles.forEach(t => showFrame(t, bmp));
+        if ($cv.checked) {
+          const c = showFrame(cvTile, bmp);
+          cvDetect(c, cvTile);
+        }
+        if ($ml.checked) {
+          const c = showFrame(cvTile, bmp); // reuse a canvas source
+          for (const t of mlTiles) {
+            const stem = t.title.replace(/^ONNX:\s*/,'');
+            runOnnxOnTile(stem, c, t);
+          }
+        }
+      } catch (e) {
+        $status.textContent = 'Snapshot error: ' + e.message;
+      }
+    });
+
+    // Kick off
+    startLoop();
+  </script>
+</body>
+</html>
