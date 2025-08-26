@@ -328,20 +328,55 @@ def mjpeg_generator_raw(alias: str):
 
 
 # ---------------- Detection: load + run (snapshot) ----------------
-def _try_import_training_model(weights_dir: str):
+def _try_import_training_model(weights_path: str):
+    """
+    Try to import a model-builder that matches the weights file.
+    Priority:
+      1) <stem>.py sitting next to <stem>.pth   (e.g., mask_cuts_detector3.[pth|py])
+      2) train_cuts_detector.py                 (legacy)
+    Returns a callable (factory) or an already-instantiated model.
+    """
     import importlib.util
-    module_path = os.path.join(weights_dir, "train_cuts_detector.py")
-    if not os.path.isfile(module_path):
-        return None
-    spec = importlib.util.spec_from_file_location("train_cuts_detector", module_path)
-    mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(mod)
-    for name in ("get_model", "create_model", "build_model", "make_model",
-                 "get_detector", "create_detector"):
-        fn = getattr(mod, name, None)
-        if callable(fn):
-            return fn
+
+    wdir = os.path.dirname(weights_path)
+    stem = os.path.splitext(os.path.basename(weights_path))[0]
+
+    candidate_modules = [
+        os.path.join(wdir, f"{stem}.py"),
+        os.path.join(wdir, "train_cuts_detector.py"),
+    ]
+
+    factories = (
+        "get_model", "create_model", "build_model", "make_model",
+        "get_detector", "create_detector",
+    )
+    classes = ("Model", "Detector")
+
+    for module_path in candidate_modules:
+        if not os.path.isfile(module_path):
+            continue
+        spec = importlib.util.spec_from_file_location(f"mdl_{stem}", module_path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+
+        # 1) explicit factory names
+        for name in factories:
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn
+        # 2) common class names that construct without args
+        for cname in classes:
+            cls = getattr(mod, cname, None)
+            if cls is not None:
+                try:
+                    return cls  # will be called like a factory below
+                except Exception:
+                    pass
+        # 3) direct model object
+        mdl = getattr(mod, "model", None)
+        if mdl is not None:
+            return lambda **_: mdl
     return None
 
 
@@ -373,8 +408,15 @@ def _load_detector(weights_path: str):
             if key in ckpt and isinstance(ckpt[key], (list, tuple)):
                 class_names = list(ckpt[key])
                 break
+        if class_names is None:
+            # support dict mapping {class_name: idx}
+            cti = ckpt.get("class_to_idx")
+            if isinstance(cti, dict) and len(cti) > 0:
+                # sort by index to get a stable list
+                inv = sorted(cti.items(), key=lambda kv: int(kv[1]))
+                class_names = [k for k, _ in inv]
 
-    ctor = _try_import_training_model(os.path.dirname(weights_path))
+    ctor = _try_import_training_model(weights_path)
     model = None
     if ctor:
         try:
@@ -403,7 +445,13 @@ def _load_detector(weights_path: str):
             num_classes = 2
         model = _build_fallback_model(num_classes=num_classes)
 
-    state = ckpt.get("model", None) or ckpt.get("state_dict", None) or ckpt
+    # Accept a variety of checkpoint layouts
+    state = (
+        ckpt.get("model", None)
+        or ckpt.get("model_state_dict", None)
+        or ckpt.get("state_dict", None)
+        or ckpt
+    )
     try:
         new_state = {k.replace("module.", ""): v for k, v in state.items()}
         model.load_state_dict(new_state, strict=False)
@@ -568,6 +616,19 @@ def snapshot_image():
     resp.headers["Content-Type"] = "image/jpeg"
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
+
+
+@app.route("/health")
+def health():
+    ok = grabber.get_frame() is not None
+    torch_ok = TORCH_OK
+    model_loaded = DETECTOR is not None
+    return {
+        "frame": ok,
+        "torch": torch_ok,
+        "model_loaded": model_loaded,
+        "model_name": os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else None,
+    }, 200 if ok else 503
 
 
 # ---------------- Main ----------------
