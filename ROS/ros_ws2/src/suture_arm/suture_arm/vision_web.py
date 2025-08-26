@@ -10,6 +10,7 @@ from typing import Optional, List, Tuple
 import numpy as np
 import cv2
 from flask import Flask, Response, render_template, abort, make_response, request, redirect, url_for
+from flask import jsonify
 from ament_index_python.packages import get_package_share_directory
 
 # ---- ZMQ Remote API client (fixed to port 23000) ----
@@ -469,13 +470,17 @@ def _draw_detections_pil(
     scores: "torch.Tensor",
     labels: "torch.Tensor",
     class_names: List[str],
+    selected_index: int | None = None,
 ) -> "Image.Image":
     draw = ImageDraw.Draw(img_pil)
     font = _pick_font(16)
-    for box, score, label in zip(boxes, scores, labels):
+    for idx, (box, score, label) in enumerate(zip(boxes, scores, labels)):
         x1, y1, x2, y2 = [float(v) for v in box.tolist()]
-        color = tuple(int((hash(int(label)) >> (i * 8)) & 255) for i in range(3))
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        # base color from label; highlight selected with a bright color & thicker stroke
+        color = (80, 180, 255) if (selected_index is not None and idx == selected_index) \
+                else tuple(int((hash(int(label)) >> (i * 8)) & 255) for i in range(3))
+        width = 5 if (selected_index is not None and idx == selected_index) else 3
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
         lid = int(label)
         cls_name = class_names[lid] if 0 <= lid < len(class_names) else f"id_{lid}"
         text = f"{cls_name} {float(score):.2f}"
@@ -540,6 +545,8 @@ def _select_weights_file() -> Optional[str]:
 
 DETECTOR = None         # (model, class_names, device)
 WEIGHTS_PATH = None     # absolute path used
+LAST_DETS = None        # dict cache from last snapshot inference
+SELECTED_DET_ID = None  # currently selected detection index
 
 
 # ---------------- Flask routes ----------------
@@ -569,10 +576,12 @@ def select_model():
     if not TORCH_OK:
         return redirect(url_for("index"))
 
-    global DETECTOR, WEIGHTS_PATH
+    global DETECTOR, WEIGHTS_PATH, LAST_DETS, SELECTED_DET_ID
     try:
         DETECTOR = _load_detector(candidate)
         WEIGHTS_PATH = candidate
+        LAST_DETS = None
+        SELECTED_DET_ID = None
         print(f"[vision_web] switched to model: {WEIGHTS_PATH}", flush=True)
     except Exception as e:
         print(f"[vision_web][ERR] failed to load {candidate}: {e}", flush=True)
@@ -603,8 +612,19 @@ def snapshot_image():
     model, class_names, device = DETECTOR
     try:
         img_pil, boxes, scores, labels = _run_inference_on_frame(model, device, frame)
+        # cache detections for the UI
+        global LAST_DETS
+        cnames = class_names or ["__background__", "cut"]
+        LAST_DETS = {
+            "boxes": boxes.numpy().tolist(),
+            "scores": scores.numpy().tolist(),
+            "labels": labels.numpy().tolist(),
+            "class_names": cnames,
+            "image_size": [img_pil.width, img_pil.height],
+            "ts": time.time(),
+        }
         vis = _draw_detections_pil(img_pil, boxes, scores, labels,
-                                   class_names or ["__background__", "cut"])
+                                   cnames, selected_index=SELECTED_DET_ID)
         jpg = _encode_pil_jpeg(vis, JPEG_QUALITY)
     except Exception as e:
         dbg = frame.copy()
@@ -616,6 +636,69 @@ def snapshot_image():
     resp.headers["Content-Type"] = "image/jpeg"
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
+
+
+@app.route("/detections")
+def detections_json():
+    """
+    Returns the last snapshot's detections as JSON:
+    [{id, score, label, label_name, box:[x1,y1,x2,y2], cx, cy, w, h, area}], plus selected_id.
+    """
+    global LAST_DETS
+    if LAST_DETS is None:
+        return jsonify({"detections": [], "message": "No snapshot run yet."})
+    boxes = LAST_DETS.get("boxes", [])
+    scores = LAST_DETS.get("scores", [])
+    labels = LAST_DETS.get("labels", [])
+    cnames = LAST_DETS.get("class_names", ["__background__", "cut"])
+    dets = []
+    for i, (b, s, l) in enumerate(zip(boxes, scores, labels)):
+        x1, y1, x2, y2 = map(float, b)
+        w = max(0.0, x2 - x1); h = max(0.0, y2 - y1)
+        cx = x1 + 0.5 * w; cy = y1 + 0.5 * h
+        lab_name = cnames[int(l)] if (0 <= int(l) < len(cnames)) else f"id_{int(l)}"
+        dets.append({
+            "id": i, "score": float(s), "label": int(l), "label_name": lab_name,
+            "box": [x1, y1, x2, y2],
+            "cx": cx, "cy": cy, "w": w, "h": h, "area": w * h,
+        })
+    return jsonify({
+        "detections": dets,
+        "selected_id": SELECTED_DET_ID,
+        "model": os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else None,
+        "ts": LAST_DETS.get("ts"),
+        "size": LAST_DETS.get("image_size"),
+    })
+
+
+@app.route("/select_cut", methods=["POST"])
+def select_cut():
+    """Set the active detection by index; used by the UI."""
+    global SELECTED_DET_ID
+    try:
+        if request.is_json:
+            payload = request.get_json(force=True, silent=True) or {}
+            idx = payload.get("id", None)
+        else:
+            idx = request.form.get("id", None)
+        if idx is None:
+            return jsonify({"ok": False, "error": "no id provided"}), 400
+        idx = int(idx)
+        # Validate against last dets length
+        n = len(LAST_DETS["boxes"]) if LAST_DETS else 0
+        if idx < 0 or idx >= n:
+            return jsonify({"ok": False, "error": f"id {idx} out of range (0..{max(0,n-1)})"}), 400
+        SELECTED_DET_ID = idx
+        return jsonify({"ok": True, "selected_id": SELECTED_DET_ID})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/clear_selection", methods=["POST"])
+def clear_selection():
+    global SELECTED_DET_ID
+    SELECTED_DET_ID = None
+    return jsonify({"ok": True, "selected_id": None})
 
 
 @app.route("/health")

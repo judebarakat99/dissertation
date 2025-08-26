@@ -33,6 +33,8 @@
     function refreshSnapshot() {
       const img = document.getElementById('snapshot');
       img.src = '/snapshot.jpg?ts=' + Date.now();
+      // once it loads, refresh the detections list so indexes match the drawn image
+      img.onload = () => loadDetections();
     }
     // Optional: auto-refresh snapshot every N seconds (set to 0 to disable)
     const SNAPSHOT_INTERVAL_SEC = 0;
@@ -41,7 +43,60 @@
       if (SNAPSHOT_INTERVAL_SEC > 0) {
         _timer = setInterval(refreshSnapshot, SNAPSHOT_INTERVAL_SEC * 1000);
       }
+      loadDetections();
     });
+
+    async function loadDetections() {
+      try {
+        const res = await fetch('/detections');
+        const data = await res.json();
+        const sel = document.getElementById('detList');
+        const status = document.getElementById('selStatus');
+        sel.innerHTML = '';
+        if (!data || !Array.isArray(data.detections) || data.detections.length === 0) {
+          const opt = document.createElement('option');
+          opt.textContent = 'No detections';
+          opt.value = '';
+          sel.appendChild(opt);
+          status.textContent = data?.message || '—';
+          return;
+        }
+        data.detections.forEach(d => {
+          const opt = document.createElement('option');
+          const lab = d.label_name ?? ('id_'+d.label);
+          opt.value = d.id;
+          opt.textContent = `#${d.id} · ${lab} · ${d.score.toFixed(2)} · [${d.box.map(v=>Math.round(v)).join(', ')}]`;
+          sel.appendChild(opt);
+        });
+        if (typeof data.selected_id === 'number') {
+          sel.value = data.selected_id;
+          status.textContent = `Selected: #${data.selected_id}`;
+        } else {
+          status.textContent = 'Selected: (none)';
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function setSelection() {
+      const sel = document.getElementById('detList');
+      const id = sel.value;
+      if (id === '' || id == null) return;
+      await fetch('/select_cut', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: Number(id) }),
+      });
+      refreshSnapshot();
+      await loadDetections();
+    }
+
+    async function clearSelection() {
+      await fetch('/clear_selection', { method: 'POST' });
+      refreshSnapshot();
+      await loadDetections();
+    }
   </script>
 </head>
 <body>
@@ -88,6 +143,15 @@
       </div>
       <img id="snapshot" class="snapshot" src="/snapshot.jpg?ts={{model}}" alt="Snapshot with overlays"/>
       <div class="row-meta">Current model: {{ model }}</div>
+
+      <hr style="border:none;border-top:1px solid #1f2a3a; margin:12px 0;">
+      <div class="controls" style="gap:8px; flex-wrap:wrap;">
+        <h2 style="margin-right:auto;">Pick a cut</h2>
+        <select id="detList" style="min-width:260px;"></select>
+        <button type="button" onclick="setSelection()">Set active</button>
+        <button type="button" onclick="clearSelection()">Clear</button>
+      </div>
+      <div id="selStatus" class="row-meta">Selected: (none)</div>
     </div>
   </main>
 </body>
