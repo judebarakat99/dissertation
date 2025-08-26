@@ -1,86 +1,94 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>CoppeliaSim Vision</title>
+  <title>CoppeliaSim vision (Top & Side) + Snapshot w/ ML</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>
-    :root { --gap: 14px; }
-    * { box-sizing: border-box; }
-    body { margin: 0; padding: 16px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#fafafa; color:#222; }
-    h1 { font-size: 20px; margin: 0 0 6px; }
-    .meta { color:#666; font-size:14px; margin-bottom: 14px; }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-      gap: var(--gap);
-      align-items: start;
+    :root { --pad: 12px; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b0c10; color:#e6edf3; }
+    header { padding: var(--pad) calc(var(--pad) * 2); background:#111926; border-bottom:1px solid #1f2a3a; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    header h1 { margin:0; font-size: 18px; font-weight:600; }
+    header .meta { font-size: 13px; opacity: 0.9; }
+    header form { display:flex; align-items:center; gap:8px; }
+    select, button {
+      background:#1b2432; color:#e6edf3; border:1px solid #2a364b; border-radius:8px; padding:8px 10px;
+      font-size:14px;
     }
-    .card {
-      background: #fff;
-      border: 1px solid #e6e6e6;
-      border-radius: 10px;
-      box-shadow: 0 1px 3px rgba(0,0,0,.06);
-      overflow: hidden;
-    }
-    .card header {
-      padding: 10px 12px;
-      border-bottom: 1px solid #eee;
-      display: flex; align-items: baseline; gap: 8px;
-    }
-    .card header h3 {
-      font-size: 16px; font-weight: 600; margin: 0;
-    }
-    .card header .sub {
-      color:#777; font-size: 12px;
-    }
-    .frame {
-      display:block;
-      width: 100%;
-      aspect-ratio: 4/3;      /* keeps panels consistent if streams differ */
-      background: #000;
-      object-fit: contain;     /* no stretching; letterbox if needed */
-    }
-    .note {
-      margin-top: 4px; color:#888; font-size: 12px;
-    }
-
-    /* Optional: make two big columns (≈40% each) on really wide screens */
-    @media (min-width: 1400px) {
-      .grid { grid-template-columns: repeat(2, minmax(520px, 1fr)); }
+    button { cursor:pointer; }
+    main { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; padding:16px; }
+    .left-col { display:flex; flex-direction:column; gap:16px; }
+    .panel { background:#0f1623; border:1px solid #1f2a3a; border-radius:12px; padding:12px; }
+    .panel h2 { margin:0 0 8px 0; font-size:14px; font-weight:600; color:#a7b6cc; }
+    .panel img { width:100%; height:auto; border-radius:8px; display:block; background:#000; }
+    .right-col .controls { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; gap:8px; }
+    .right-col .controls h2 { margin:0; font-size:14px; font-weight:600; color:#a7b6cc; }
+    .right-col .snapshot { width:100%; aspect-ratio: 16/10; background:#000; border-radius:8px; border:1px solid #1f2a3a; object-fit:contain; }
+    .row-meta { font-size:12px; color:#9fb0c6; opacity:0.9; margin-top:4px; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
     }
   </style>
+  <script>
+    function refreshSnapshot() {
+      const img = document.getElementById('snapshot');
+      img.src = '/snapshot.jpg?ts=' + Date.now();
+    }
+    // Optional: auto-refresh snapshot every N seconds (set to 0 to disable)
+    const SNAPSHOT_INTERVAL_SEC = 0;
+    let _timer = null;
+    window.addEventListener('load', () => {
+      if (SNAPSHOT_INTERVAL_SEC > 0) {
+        _timer = setInterval(refreshSnapshot, SNAPSHOT_INTERVAL_SEC * 1000);
+      }
+    });
+  </script>
 </head>
 <body>
-  <h1>CoppeliaSim vision streams</h1>
-  <div class="meta">
-    Sensor: <b>{{ sensor }}</b> &nbsp;•&nbsp; ZMQ: <b>{{ host }}:{{ port }}</b>
-  </div>
-
-  <div class="grid">
-    <!-- RAW stream -->
-    <div class="card">
-      <header>
-        <h3>Raw</h3>
-        <span class="sub">/stream_raw</span>
-      </header>
-      <img class="frame" src="/stream_raw" alt="Raw vision stream"/>
+  <header>
+    <div>
+      <h1>CoppeliaSim vision stream (Top & Side)</h1>
+      <div class="meta">
+        Top sensor: {{ top_sensor }} • Side sensor: {{ side_sensor }} • ZMQ: {{ host }}:{{ port }}
+      </div>
     </div>
 
-    <!-- Overlays (each in its own card) -->
-    {% for m in loaded_models %}
-      <div class="card">
-        <header>
-          <h3>{{ m }}</h3>
-          <span class="sub">/stream_model/{{ m }}</span>
-        </header>
-        <img class="frame" src="/stream_model/{{ m }}" alt="{{ m }} overlay stream"/>
-      </div>
-    {% endfor %}
-  </div>
+    <form method="POST" action="/select_model">
+      <label for="weights">Model:&nbsp;</label>
+      <select name="weights" id="weights">
+        {% for w in models %}
+          <option value="{{w}}" {% if w == model %}selected{% endif %}>{{w}}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Load</button>
+    </form>
+  </header>
 
-  {% if not loaded_models or loaded_models|length == 0 %}
-    <p class="note">No models loaded. Ensure your <code>*.py</code> wrappers and <code>*.pth</code> files are in
-      <code>share/suture_arm/ml</code> (installed) or <code>src/suture_arm/ML_detection</code> (source).</p>
-  {% endif %}
+  <main>
+    <!-- LEFT COLUMN: Top and Side raw streams -->
+    <div class="left-col">
+      <div class="panel">
+        <h2>Top view</h2>
+        <img src="/stream_raw/top" alt="Top view stream"/>
+        <div class="row-meta">Live raw feed from {{ top_sensor }}</div>
+      </div>
+
+      <div class="panel">
+        <h2>Side view</h2>
+        <img src="/stream_raw/side" alt="Side view stream"/>
+        <div class="row-meta">Live raw feed from {{ side_sensor }}</div>
+      </div>
+    </div>
+
+    <!-- RIGHT COLUMN: Snapshot with detections -->
+    <div class="right-col panel">
+      <div class="controls">
+        <h2>Snapshot with detection overlays (from Top view)</h2>
+        <button type="button" onclick="refreshSnapshot()">Snapshot</button>
+      </div>
+      <img id="snapshot" class="snapshot" src="/snapshot.jpg?ts={{model}}" alt="Snapshot with overlays"/>
+      <div class="row-meta">Current model: {{ model }}</div>
+    </div>
+  </main>
 </body>
 </html>

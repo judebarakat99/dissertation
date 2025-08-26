@@ -2,49 +2,56 @@
 # -*- coding: utf-8 -*-
 
 import os
+import io
 import time
-import types
 import threading
-import importlib.util
-from typing import Optional, Dict, Any, List
+from typing import Optional, List, Tuple
 
 import numpy as np
 import cv2
-from flask import Flask, Response, render_template
-
-# ----- ROS2 share discovery for templates -----
+from flask import Flask, Response, render_template, abort, make_response, request, redirect, url_for
 from ament_index_python.packages import get_package_share_directory
 
-# ----- ZMQ Remote API client (fixed port 23000 as requested) -----
+# ---- ZMQ Remote API client (fixed to port 23000) ----
 try:
     from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 except ImportError:
-    from zmqRemoteApi import RemoteAPIClient  # legacy name, if needed
+    from zmqRemoteApi import RemoteAPIClient  # legacy
+
+# ---- Torch / torchvision (for detection snapshot) ----
+try:
+    import torch
+    import torchvision
+    from torchvision.ops import nms
+    from torchvision.transforms import functional as F
+    from PIL import Image, ImageDraw, ImageFont
+    TORCH_OK = True
+except Exception as e:
+    TORCH_OK = False
+    _TORCH_ERR = str(e)
 
 # ---------------- Configuration ----------------
 CSIM_HOST = "127.0.0.1"
 CSIM_PORT = 23000
-SENSOR_ALIAS = "/visionSensor"     # change here if your alias differs
+
+TOP_SENSOR_ALIAS  = "/visionSensor"
+SIDE_SENSOR_ALIAS = "/visionSensor_SideView"
+
 FPS = 15
 JPEG_QUALITY = 90
-STEPPED = 1                        # use stepped mode for stable reads
 
-MODEL_STEMS = [
-    #"mask_cuts_detector",
-    "cuts_detector_best",
-    # "mask_cuts_detector2",
-    # "cuts_detector_best2",
-    # "mask_cuts_detector3",
-]
+# Snapshot capture (right panel) uses stepped mode for stability.
+STEPPED_SNAPSHOT = 1
+# RAW streams (left column) use non-stepped readers like the older working version.
+STEPPED_RAW = 0
 # ------------------------------------------------
 
 
+# ---------------- Template & models directories ----------------
 def _find_templates_dir() -> str:
-    # 0) optional override for debugging
-    env_tdir = os.getenv("SUTURE_ARM_TEMPLATES", "")
-    if env_tdir and os.path.isdir(env_tdir):
-        return env_tdir
-    # 1) installed share dir
+    env = os.getenv("SUTURE_ARM_TEMPLATES", "")
+    if env and os.path.isdir(env):
+        return env
     try:
         share = get_package_share_directory("suture_arm")
         tdir = os.path.join(share, "templates")
@@ -52,18 +59,14 @@ def _find_templates_dir() -> str:
             return tdir
     except Exception:
         pass
-    # 2) fallback to source tree
     here = os.path.dirname(__file__)
-    tdir = os.path.abspath(os.path.join(here, "..", "templates"))
-    return tdir
+    return os.path.abspath(os.path.join(here, "..", "templates"))
 
 
 def _find_models_root() -> str:
-    # 0) optional override
-    env_mdir = os.getenv("SUTURE_ARM_ML", "")
-    if env_mdir and os.path.isdir(env_mdir):
-        return env_mdir
-    # 1) installed share dir
+    env = os.getenv("SUTURE_ARM_ML", "")
+    if env and os.path.isdir(env):
+        return env
     try:
         share = get_package_share_directory("suture_arm")
         mdir = os.path.join(share, "ml")
@@ -71,29 +74,25 @@ def _find_models_root() -> str:
             return mdir
     except Exception:
         pass
-    # 2) fallback to source tree
     here = os.path.dirname(__file__)
-    mdir = os.path.abspath(os.path.join(here, "..", "ML_detection"))
-    return mdir
+    return os.path.abspath(os.path.join(here, "..", "ML_detection"))
 
 
 TEMPLATES_DIR = _find_templates_dir()
 MODELS_ROOT = _find_models_root()
 
-print(f"[vision_web] templates dir: {TEMPLATES_DIR}", flush=True)
-print(f"[vision_web] models root  : {MODELS_ROOT}", flush=True)
-
 if not os.path.isfile(os.path.join(TEMPLATES_DIR, "index.html")):
     raise RuntimeError(
         f"index.html not found in {TEMPLATES_DIR}. "
-        "Ensure it's installed to share/suture_arm/templates or set SUTURE_ARM_TEMPLATES."
+        "Place it under src/suture_arm/templates/ or set SUTURE_ARM_TEMPLATES."
     )
 
 app = Flask(__name__, template_folder=TEMPLATES_DIR)
 
 
-# --------------- Single capture thread ---------------
+# ---------------- Snapshot vision capture (background thread) ----------------
 class FrameGrabber:
+    """Background grabber for TOP sensor frames used by the snapshot detection."""
     def __init__(self, host: str, port: int, sensor_alias: str):
         self.host = host
         self.port = port
@@ -101,8 +100,8 @@ class FrameGrabber:
         self.client = None
         self.sim = None
         self.sensor = None
-        self._lock = threading.Lock()
         self._last = None  # (bgr, ts)
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
 
@@ -121,6 +120,7 @@ class FrameGrabber:
         if self.sensor is None:
             raise RuntimeError(f"Vision sensor '{self.sensor_alias}' not found")
 
+        # Start if needed
         try:
             st = self.sim.getSimulationState()
             if st in (self.sim.simulation_stopped, self.sim.simulation_paused):
@@ -128,21 +128,40 @@ class FrameGrabber:
         except Exception:
             pass
 
-        if STEPPED and hasattr(self.sim, "setStepping"):
+        # Stepping for stable snapshot grabs
+        if STEPPED_SNAPSHOT and hasattr(self.sim, "setStepping"):
             try:
                 self.sim.setStepping(True)
             except Exception:
                 pass
 
+    def _decode(self, img, w, h) -> np.ndarray:
+        buf = np.frombuffer(img, dtype=np.uint8) if isinstance(img, (bytes, bytearray)) else np.array(img, dtype=np.uint8)
+        n = buf.size
+        if n == w*h:
+            frame = cv2.cvtColor(np.flip(buf.reshape(h, w), 0), cv2.COLOR_GRAY2BGR)
+        elif n == w*h*3:
+            frame = np.flip(buf.reshape(h, w, 3), 0)[:, :, ::-1]
+        elif n == w*h*4:
+            frame = np.flip(buf.reshape(h, w, 4), 0)[:, :, :3][:, :, ::-1]
+        else:
+            if (w*h) and n % (w*h) == 0:
+                c = n // (w*h)
+                frame = np.flip(buf.reshape(h, w, c), 0)[:, :, :3][:, :, ::-1]
+            else:
+                raise RuntimeError(f"unexpected buffer size n={n} vs {w}x{h}")
+        if not (frame.flags["C_CONTIGUOUS"] and frame.flags["WRITEABLE"]):
+            frame = np.ascontiguousarray(frame.copy())
+        return frame
+
     def _read_frame(self) -> np.ndarray:
-        # Handle explicitHandling if enabled
         try:
             if bool(self.sim.getObjectInt32Param(self.sensor, self.sim.visionintparam_explicit_handling)):
                 self.sim.handleVisionSensor(self.sensor)
         except Exception:
             pass
 
-        if STEPPED and hasattr(self.sim, "setStepping"):
+        if STEPPED_SNAPSHOT and hasattr(self.sim, "setStepping"):
             try:
                 self.sim.step()
             except Exception:
@@ -150,7 +169,7 @@ class FrameGrabber:
 
         # Robust fetch across API variants
         try:
-            img, res = self.sim.getVisionSensorImg(self.sensor)  # (buf, [w,h])
+            img, res = self.sim.getVisionSensorImg(self.sensor)  # bytes, [w,h]
             w, h = int(res[0]), int(res[1])
         except Exception:
             try:
@@ -168,24 +187,7 @@ class FrameGrabber:
                 except Exception as e2:
                     raise RuntimeError(f"getVisionSensor* failed: {e1} / {e2}")
 
-        buf = np.frombuffer(img, dtype=np.uint8) if isinstance(img, (bytes, bytearray)) else np.array(img, dtype=np.uint8)
-        n = buf.size
-        if n == w*h:
-            frame = cv2.cvtColor(np.flip(buf.reshape(h, w), 0), cv2.COLOR_GRAY2BGR)
-        elif n == w*h*3:
-            frame = np.flip(buf.reshape(h, w, 3), 0)[:, :, ::-1]
-        elif n == w*h*4:
-            frame = np.flip(buf.reshape(h, w, 4), 0)[:, :, :3][:, :, ::-1]
-        else:
-            if (w*h) and n % (w*h) == 0:
-                c = n // (w*h)
-                frame = np.flip(buf.reshape(h, w, c), 0)[:, :, :3][:, :, ::-1]
-            else:
-                raise RuntimeError(f"unexpected buffer size n={n} vs {w}x{h}")
-
-        if not (frame.flags["C_CONTIGUOUS"] and frame.flags["WRITEABLE"]):
-            frame = np.ascontiguousarray(frame.copy())
-        return frame
+        return self._decode(img, w, h)
 
     def _loop(self):
         period = 1.0 / max(1, FPS)
@@ -197,7 +199,7 @@ class FrameGrabber:
                 with self._lock:
                     self._last = (frame, time.time())
             except Exception as e:
-                print(f"[vision_web][ERR] capture: {e}", flush=True)
+                print(f"[vision_web][ERR] snapshot capture: {e}", flush=True)
                 time.sleep(0.1)
             time.sleep(max(0.0, period * 0.5))
 
@@ -213,86 +215,85 @@ class FrameGrabber:
             return self._last[0].copy()
 
 
-grabber = FrameGrabber(CSIM_HOST, CSIM_PORT, SENSOR_ALIAS)
+grabber = FrameGrabber(CSIM_HOST, CSIM_PORT, TOP_SENSOR_ALIAS)
 
 
-# --------------- Model wrappers (no sim calls here) ---------------
-class ModelWrapper:
-    def __init__(self, root: str, stem: str):
-        self.root = root
-        self.stem = stem
-        self.pth = os.path.join(root, stem + ".pth")
-        self.py  = os.path.join(root, stem + ".py")
-        self.mod: Optional[types.ModuleType] = None
-        self.handle = None
-        self.ok = False
-        self.err = None
-        self._load()
+# ---------------- Legacy RAW readers for top & side streams ----------------
+_raw_ctx = {}  # alias -> {"client":..., "sim":..., "sensor":...}
 
-    def _load(self):
+def _raw_connect(alias: str):
+    if alias in _raw_ctx and _raw_ctx[alias].get("sim") and _raw_ctx[alias].get("sensor"):
+        return
+    client = RemoteAPIClient(CSIM_HOST, CSIM_PORT)
+    sim = client.require('sim')
+
+    sensor = None
+    for cand in (alias, alias.lstrip('/'), alias + '#0'):
         try:
-            if not os.path.isfile(self.py):
-                raise FileNotFoundError(f"wrapper not found: {self.py}")
-            if not os.path.isfile(self.pth):
-                raise FileNotFoundError(f"model not found: {self.pth}")
+            sensor = sim.getObject(cand)
+            break
+        except Exception:
+            pass
+    if sensor is None:
+        raise RuntimeError(f"RAW: vision sensor '{alias}' not found")
 
-            spec = importlib.util.spec_from_file_location(f"suture_arm.plugins.{self.stem}", self.py)
-            mod = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(mod)
-            if not hasattr(mod, "load") or not hasattr(mod, "predict"):
-                raise RuntimeError("wrapper must define load() and predict()")
-            self.mod = mod
-            self.handle = mod.load(self.pth)
-            self.ok = True
-        except Exception as e:
-            self.err = str(e)
-            self.ok = False
-
-    def predict(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
-        if not self.ok:
-            raise RuntimeError(self.err or "model not loaded")
-        return self.mod.predict(self.handle, frame_bgr)
-
-
-def load_all_models() -> Dict[str, ModelWrapper]:
-    models: Dict[str, ModelWrapper] = {}
-    for stem in MODEL_STEMS:
-        mw = ModelWrapper(MODELS_ROOT, stem)
-        models[stem] = mw
-        if mw.ok:
-            print(f"[vision_web] loaded: {stem}", flush=True)
-        else:
-            print(f"[vision_web] WARN: {stem} not loaded -> {mw.err}", flush=True)
-    return models
-
-
-MODELS: Dict[str, ModelWrapper] = {}
-
-
-# ---------------- Overlay renderer ----------------
-def draw_overlay(frame_bgr: np.ndarray, result: Dict[str, Any]) -> np.ndarray:
-    img = frame_bgr.copy()
+    # Ensure simulation is running, but do NOT enable stepping here
     try:
-        cuts = result.get("cuts", [])
-        for c in cuts:
-            poly = c.get("polyline", [])
-            pts = np.array(poly, dtype=float)
-            # Here we assume the wrapper returns **pixel** polylines. If your
-            # wrappers output meters, add projection in the wrapper so they
-            # return pixels for the browser overlay.
-            if pts.ndim == 2 and pts.shape[1] >= 2:
-                pts = pts.astype(int)
-                for i in range(len(pts) - 1):
-                    cv2.line(img, tuple(pts[i]), tuple(pts[i + 1]),
-                             (40, 255, 40), 2, cv2.LINE_AA)
-    except Exception as e:
-        cv2.putText(img, f"overlay error: {e}", (10, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-    return img
+        st = sim.getSimulationState()
+        if st in (sim.simulation_stopped, sim.simulation_paused):
+            sim.startSimulation()
+    except Exception:
+        pass
+
+    _raw_ctx[alias] = {"client": client, "sim": sim, "sensor": sensor}
 
 
-# ---------------- MJPEG generators (no sim calls) ----------------
+def _raw_read_once(alias: str) -> np.ndarray:
+    ctx = _raw_ctx[alias]
+    sim = ctx["sim"]; sensor = ctx["sensor"]
+
+    try:
+        if bool(sim.getObjectInt32Param(sensor, sim.visionintparam_explicit_handling)):
+            sim.handleVisionSensor(sensor)
+    except Exception:
+        pass
+
+    # Prefer the CharImage API first (what worked before)
+    try:
+        img, w, h = sim.getVisionSensorCharImage(sensor)
+    except Exception:
+        try:
+            img, res = sim.getVisionSensorImg(sensor)  # bytes, [w,h]
+            w, h = int(res[0]), int(res[1])
+        except Exception:
+            out = sim.getVisionSensorImage(sensor)
+            if isinstance(out, (list, tuple)) and len(out) == 3 and isinstance(out[1], (int, float)):
+                img, w, h = out; w, h = int(w), int(h)
+            else:
+                img, res = out; w, h = int(res[0]), int(res[1])
+            if isinstance(img, (list, tuple, np.ndarray)) and not isinstance(img, (bytes, bytearray)):
+                arr = np.array(img, dtype=np.float32)
+                img = (arr * 255).clip(0, 255).astype(np.uint8).tobytes()
+
+    buf = np.frombuffer(img, dtype=np.uint8) if isinstance(img, (bytes, bytearray)) else np.array(img, dtype=np.uint8)
+    n = buf.size
+
+    if n % 3 == 0:
+        frame = np.flip(buf.reshape(h, w, 3), 0)[:, :, ::-1]
+    elif n == w * h:
+        frame = cv2.cvtColor(np.flip(buf.reshape(h, w), 0), cv2.COLOR_GRAY2BGR)
+    else:
+        if (w*h) and n % (w*h) == 0:
+            c = n // (w*h)
+            frame = np.flip(buf.reshape(h, w, c), 0)[:, :, :3][:, :, ::-1]
+        else:
+            raise RuntimeError(f"RAW({alias}): unexpected buffer size n={n} vs {w}x{h}")
+
+    if not (frame.flags["C_CONTIGUOUS"] and frame.flags["WRITEABLE"]):
+        frame = np.ascontiguousarray(frame.copy())
+    return frame
+
+
 def _encode_jpeg(bgr: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
     ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
@@ -300,86 +301,303 @@ def _encode_jpeg(bgr: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
     return enc.tobytes()
 
 
-def mjpeg_generator_raw():
+def mjpeg_generator_raw(alias: str):
+    # Connect once per alias, read each frame freshly
+    try:
+        _raw_connect(alias)
+    except Exception as e:
+        msg = np.zeros((240, 320, 3), np.uint8)
+        cv2.putText(msg, f"RAW connect error: {e}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _encode_jpeg(msg) + b"\r\n")
+        return
+
+    period = 1.0 / max(1, FPS)
     while True:
-        frame = grabber.get_frame()
-        if frame is None:
-            time.sleep(0.05); continue
         try:
+            frame = _raw_read_once(alias)
             jpg = _encode_jpeg(frame)
-        except Exception:
-            time.sleep(0.02); continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-        time.sleep(1.0 / max(1, FPS))
-
-
-def mjpeg_generator_model(stem: str):
-    mw = MODELS.get(stem)
-    if mw is None or not mw.ok:
-        # persistent error card
-        canvas = np.zeros((240, 320, 3), np.uint8)
-        msg = f"{stem}: not loaded"
-        cv2.putText(canvas, msg, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 0, 255), 2, cv2.LINE_AA)
-        err_jpg = _encode_jpeg(canvas, 90)
-        while True:
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + err_jpg + b"\r\n")
-            time.sleep(0.5)
-
-    while True:
-        frame = grabber.get_frame()
-        if frame is None:
-            time.sleep(0.05); continue
-        try:
-            result = mw.predict(frame)
-            drawn = draw_overlay(frame, result)
-            jpg = _encode_jpeg(drawn)
         except Exception as e:
-            drawn = frame.copy()
-            cv2.putText(drawn, f"{stem} error: {e}", (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-            jpg = _encode_jpeg(drawn)
+            err = np.zeros((240, 320, 3), np.uint8)
+            cv2.putText(err, f"RAW error: {str(e)[:40]}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+            jpg = _encode_jpeg(err)
+            time.sleep(0.1)
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-        time.sleep(1.0 / max(1, FPS))
+        time.sleep(period)
 
 
-# ---------------- Routes ----------------
+# ---------------- Detection: load + run (snapshot) ----------------
+def _try_import_training_model(weights_dir: str):
+    import importlib.util
+    module_path = os.path.join(weights_dir, "train_cuts_detector.py")
+    if not os.path.isfile(module_path):
+        return None
+    spec = importlib.util.spec_from_file_location("train_cuts_detector", module_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    for name in ("get_model", "create_model", "build_model", "make_model",
+                 "get_detector", "create_detector"):
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _pick_font(size: int = 16):
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=size)
+        except Exception:
+            return None
+
+
+def _build_fallback_model(num_classes: int = 2):
+    return torchvision.models.detection.fasterrcnn_resnet50_fpn(
+        weights=None,
+        weights_backbone="IMAGENET1K_V1",
+        num_classes=num_classes
+    )
+
+
+def _load_detector(weights_path: str):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(weights_path, map_location="cpu")
+
+    class_names = None
+    if isinstance(ckpt, dict):
+        for key in ("classes", "class_names", "names", "labels"):
+            if key in ckpt and isinstance(ckpt[key], (list, tuple)):
+                class_names = list(ckpt[key])
+                break
+
+    ctor = _try_import_training_model(os.path.dirname(weights_path))
+    model = None
+    if ctor:
+        try:
+            if class_names:
+                if class_names and class_names[0].lower() in ("__background__", "background", "bg"):
+                    num_classes = len(class_names)
+                else:
+                    num_classes = len(class_names) + 1
+            else:
+                num_classes = 2
+            try:
+                model = ctor(num_classes=num_classes)
+            except TypeError:
+                model = ctor()
+        except Exception as e:
+            print(f"[vision_web][WARN] train ctor failed: {e}")
+
+    if model is None:
+        if class_names:
+            if class_names and class_names[0].lower() in ("__background__", "background", "bg"):
+                num_classes = len(class_names)
+            else:
+                num_classes = len(class_names) + 1
+        else:
+            class_names = ["__background__", "cut"]
+            num_classes = 2
+        model = _build_fallback_model(num_classes=num_classes)
+
+    state = ckpt.get("model", None) or ckpt.get("state_dict", None) or ckpt
+    try:
+        new_state = {k.replace("module.", ""): v for k, v in state.items()}
+        model.load_state_dict(new_state, strict=False)
+    except Exception as e:
+        print(f"[vision_web][WARN] non-strict load: {e}")
+        model.load_state_dict(state, strict=False)
+
+    model.eval().to(device)
+    return model, class_names, device
+
+
+def _draw_detections_pil(
+    img_pil: "Image.Image",
+    boxes: "torch.Tensor",
+    scores: "torch.Tensor",
+    labels: "torch.Tensor",
+    class_names: List[str],
+) -> "Image.Image":
+    draw = ImageDraw.Draw(img_pil)
+    font = _pick_font(16)
+    for box, score, label in zip(boxes, scores, labels):
+        x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+        color = tuple(int((hash(int(label)) >> (i * 8)) & 255) for i in range(3))
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        lid = int(label)
+        cls_name = class_names[lid] if 0 <= lid < len(class_names) else f"id_{lid}"
+        text = f"{cls_name} {float(score):.2f}"
+        if font:
+            tw, th = draw.textbbox((0, 0), text, font=font)[2:]
+        else:
+            tw, th = (8 * len(text), 14)
+        pad = 2
+        draw.rectangle([x1, y1 - th - 2 * pad, x1 + tw + 2 * pad, y1], fill=color)
+        draw.text((x1 + pad, y1 - th - pad), text, fill=(255, 255, 255), font=font)
+    return img_pil
+
+
+@torch.inference_mode()
+def _run_inference_on_frame(
+    model, device, frame_bgr: np.ndarray,
+    conf_thresh: float = 0.4,
+    iou_thresh: float = 0.5
+) -> Tuple["Image.Image", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_rgb)
+    tens = F.to_tensor(img_pil).to(device)
+    outputs = model([tens])[0]
+    boxes = outputs.get("boxes", torch.empty((0, 4), device=device))
+    scores = outputs.get("scores", torch.empty((0,), device=device))
+    labels = outputs.get("labels", torch.empty((0,), dtype=torch.long, device=device))
+
+    keep = scores >= conf_thresh
+    boxes = boxes[keep]; scores = scores[keep]; labels = labels[keep]
+
+    if boxes.numel() > 0:
+        keep_idx = nms(boxes, scores, iou_thresh)
+        boxes = boxes[keep_idx]; scores = scores[keep_idx]; labels = labels[keep_idx]
+    return img_pil, boxes.cpu(), scores.cpu(), labels.cpu()
+
+
+def _encode_pil_jpeg(img_pil: "Image.Image", quality: int = JPEG_QUALITY) -> bytes:
+    buf = io.BytesIO()
+    img_pil.save(buf, format="JPEG", quality=int(quality))
+    return buf.getvalue()
+
+
+# ---------------- Model selection & load ----------------
+def _available_models() -> List[str]:
+    try:
+        files = [f for f in os.listdir(MODELS_ROOT) if f.lower().endswith(".pth")]
+        files.sort()
+        return files
+    except Exception:
+        return []
+
+
+def _select_weights_file() -> Optional[str]:
+    forced = os.getenv("SELECTED_WEIGHTS", "").strip()
+    if forced:
+        cand = forced if os.path.isabs(forced) else os.path.join(MODELS_ROOT, forced)
+        if os.path.isfile(cand):
+            return cand
+    models = _available_models()
+    return os.path.join(MODELS_ROOT, models[0]) if models else None
+
+
+DETECTOR = None         # (model, class_names, device)
+WEIGHTS_PATH = None     # absolute path used
+
+
+# ---------------- Flask routes ----------------
 @app.route("/")
 def index():
-    loaded = [k for k, v in MODELS.items() if v.ok]
-    return render_template("index.html",
-                           sensor=SENSOR_ALIAS,
-                           host=CSIM_HOST,
-                           port=CSIM_PORT,
-                           loaded_models=loaded)
+    model_name = os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else "(none)"
+    return render_template(
+        "index.html",
+        top_sensor=TOP_SENSOR_ALIAS,
+        side_sensor=SIDE_SENSOR_ALIAS,
+        host=CSIM_HOST,
+        port=CSIM_PORT,
+        model=model_name,
+        models=_available_models(),  # for dropdown
+    )
 
-@app.route("/stream_raw")
-def stream_raw():
-    return Response(mjpeg_generator_raw(),
+
+@app.route("/select_model", methods=["POST"])
+def select_model():
+    fname = request.form.get("weights", "").strip()
+    if not fname:
+        return redirect(url_for("index"))
+    candidate = os.path.join(MODELS_ROOT, fname)
+    if not os.path.isfile(candidate):
+        return redirect(url_for("index"))
+
+    if not TORCH_OK:
+        return redirect(url_for("index"))
+
+    global DETECTOR, WEIGHTS_PATH
+    try:
+        DETECTOR = _load_detector(candidate)
+        WEIGHTS_PATH = candidate
+        print(f"[vision_web] switched to model: {WEIGHTS_PATH}", flush=True)
+    except Exception as e:
+        print(f"[vision_web][ERR] failed to load {candidate}: {e}", flush=True)
+    return redirect(url_for("index"))
+
+
+@app.route("/stream_raw/<which>")
+def stream_raw(which: str):
+    alias = TOP_SENSOR_ALIAS if which == "top" else SIDE_SENSOR_ALIAS
+    return Response(mjpeg_generator_raw(alias),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
-@app.route("/stream_model/<stem>")
-def stream_model(stem: str):
-    return Response(mjpeg_generator_model(stem),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/snapshot.jpg")
+def snapshot_image():
+    """One-shot detection overlay image (right panel), using the TOP view."""
+    frame = grabber.get_frame()
+    if frame is None:
+        abort(503, "no frame yet")
+
+    if not TORCH_OK or DETECTOR is None:
+        # If no model, just return the raw frame to keep page useful
+        jpg = _encode_jpeg(frame)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    model, class_names, device = DETECTOR
+    try:
+        img_pil, boxes, scores, labels = _run_inference_on_frame(model, device, frame)
+        vis = _draw_detections_pil(img_pil, boxes, scores, labels,
+                                   class_names or ["__background__", "cut"])
+        jpg = _encode_pil_jpeg(vis, JPEG_QUALITY)
+    except Exception as e:
+        dbg = frame.copy()
+        cv2.putText(dbg, f"inference error: {e}", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        jpg = _encode_jpeg(dbg)
+
+    resp = make_response(jpg)
+    resp.headers["Content-Type"] = "image/jpeg"
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
-# ---------------- Main entry ----------------
+# ---------------- Main ----------------
 def main():
-    # start capture first
-    grabber.start()
+    print(f"[vision_web] templates dir: {TEMPLATES_DIR}", flush=True)
+    print(f"[vision_web] models root  : {MODELS_ROOT}", flush=True)
 
-    # warm up a bit for first frame
+    # start snapshot (TOP) capture thread
+    grabber.start()
     t0 = time.time()
     while grabber.get_frame() is None and (time.time() - t0) < 5.0:
         time.sleep(0.05)
 
-    # load models (no sim calls)
-    global MODELS
-    MODELS = load_all_models()
+    # load a detector (once) if torch is available
+    global DETECTOR, WEIGHTS_PATH
+    if TORCH_OK:
+        WEIGHTS_PATH = _select_weights_file()
+        if WEIGHTS_PATH and os.path.isfile(WEIGHTS_PATH):
+            try:
+                DETECTOR = _load_detector(WEIGHTS_PATH)
+                print(f"[vision_web] loaded weights: {WEIGHTS_PATH}", flush=True)
+            except Exception as e:
+                print(f"[vision_web][ERR] failed to load detector: {e}", flush=True)
+                DETECTOR = None
+        else:
+            print("[vision_web] no *.pth found under models root", flush=True)
+    else:
+        print(f"[vision_web][WARN] PyTorch unavailable: {_TORCH_ERR}", flush=True)
 
-    print(f"[vision_web] connecting   : {CSIM_HOST}:{CSIM_PORT}", flush=True)
-    print(f"[vision_web] ready on     : http://0.0.0.0:8000/", flush=True)
+    print(f"[vision_web] open http://127.0.0.1:8000/", flush=True)
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
 
 
