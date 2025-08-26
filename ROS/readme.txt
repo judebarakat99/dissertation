@@ -1,5 +1,3 @@
-Here’s a drop-in **README.md** you can add to your repo. It documents the whole pipeline (UR3 + CoppeliaSim + ROS 2 + vision web UI + models), the exact object names, env-vars, and common fixes.
-
 ---
 
 # UR3 Suturing (ROS 2 Humble + CoppeliaSim, no MoveIt)
