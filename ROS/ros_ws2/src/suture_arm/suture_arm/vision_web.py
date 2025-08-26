@@ -491,6 +491,15 @@ def _draw_detections_pil(
         pad = 2
         draw.rectangle([x1, y1 - th - 2 * pad, x1 + tw + 2 * pad, y1], fill=color)
         draw.text((x1 + pad, y1 - th - pad), text, fill=(255, 255, 255), font=font)
+        # draw a small tag with the numeric index for easy reference
+        idx_text = f"#{idx}"
+        if font:
+            itw, ith = draw.textbbox((0,0), idx_text, font=font)[2:]
+        else:
+            itw, ith = (12, 12)
+        tag_pad = 2
+        draw.rectangle([x1, y1, x1 + itw + 2*tag_pad, y1 + ith + 2*tag_pad], fill=(0,0,0))
+        draw.text((x1 + tag_pad, y1 + tag_pad), idx_text, fill=(255,255,255), font=font)
     return img_pil
 
 
@@ -543,10 +552,11 @@ def _select_weights_file() -> Optional[str]:
     return os.path.join(MODELS_ROOT, models[0]) if models else None
 
 
-DETECTOR = None         # (model, class_names, device)
-WEIGHTS_PATH = None     # absolute path used
-LAST_DETS = None        # dict cache from last snapshot inference
-SELECTED_DET_ID = None  # currently selected detection index
+DETECTOR = None           # (model, class_names, device)
+WEIGHTS_PATH = None       # absolute path used
+LAST_DETS = None          # dict cache from last snapshot inference
+LAST_FRAME_PIL = None     # last snapshot PIL image (for cropping)
+SELECTED_DET_ID = None    # currently selected detection index
 
 
 # ---------------- Flask routes ----------------
@@ -576,11 +586,12 @@ def select_model():
     if not TORCH_OK:
         return redirect(url_for("index"))
 
-    global DETECTOR, WEIGHTS_PATH, LAST_DETS, SELECTED_DET_ID
+    global DETECTOR, WEIGHTS_PATH, LAST_DETS, SELECTED_DET_ID, LAST_FRAME_PIL
     try:
         DETECTOR = _load_detector(candidate)
         WEIGHTS_PATH = candidate
         LAST_DETS = None
+        LAST_FRAME_PIL = None
         SELECTED_DET_ID = None
         print(f"[vision_web] switched to model: {WEIGHTS_PATH}", flush=True)
     except Exception as e:
@@ -613,7 +624,7 @@ def snapshot_image():
     try:
         img_pil, boxes, scores, labels = _run_inference_on_frame(model, device, frame)
         # cache detections for the UI
-        global LAST_DETS
+        global LAST_DETS, LAST_FRAME_PIL
         cnames = class_names or ["__background__", "cut"]
         LAST_DETS = {
             "boxes": boxes.numpy().tolist(),
@@ -623,6 +634,7 @@ def snapshot_image():
             "image_size": [img_pil.width, img_pil.height],
             "ts": time.time(),
         }
+        LAST_FRAME_PIL = img_pil.copy()
         vis = _draw_detections_pil(img_pil, boxes, scores, labels,
                                    cnames, selected_index=SELECTED_DET_ID)
         jpg = _encode_pil_jpeg(vis, JPEG_QUALITY)
@@ -699,6 +711,57 @@ def clear_selection():
     global SELECTED_DET_ID
     SELECTED_DET_ID = None
     return jsonify({"ok": True, "selected_id": None})
+
+
+@app.route("/selected_crop.jpg")
+def selected_crop():
+    """
+    Return a JPEG crop of the selected detection (or of ?id=<int>), with optional
+    fractional padding (?pad=0.08) and optional resize width (?size=256).
+    """
+    if LAST_DETS is None or LAST_FRAME_PIL is None:
+        abort(503, "no snapshot available")
+    # read params
+    try:
+        det_id = request.args.get("id", None, type=int)
+        pad = request.args.get("pad", default=0.08, type=float)
+        outw = request.args.get("size", default=None, type=int)
+    except Exception:
+        det_id = None; pad = 0.08; outw = None
+
+    if det_id is None:
+        det_id = SELECTED_DET_ID
+    if det_id is None:
+        # no selection -> return a tiny info image
+        info = np.zeros((120, 240, 3), np.uint8)
+        cv2.putText(info, "No selection", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+        jpg = _encode_jpeg(info)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    boxes = LAST_DETS.get("boxes", [])
+    if det_id < 0 or det_id >= len(boxes):
+        abort(400, f"id {det_id} out of range")
+    x1, y1, x2, y2 = [float(v) for v in boxes[det_id]]
+    W, H = LAST_DETS.get("image_size", [LAST_FRAME_PIL.width, LAST_FRAME_PIL.height])
+    # add fractional padding
+    pw = pad * (x2 - x1); ph = pad * (y2 - y1)
+    xx1 = max(0, int(np.floor(x1 - pw))); yy1 = max(0, int(np.floor(y1 - ph)))
+    xx2 = min(int(np.ceil(x2 + pw)), int(W)); yy2 = min(int(np.ceil(y2 + ph)), int(H))
+    if xx2 <= xx1 or yy2 <= yy1:
+        abort(500, "invalid crop bounds")
+    crop = LAST_FRAME_PIL.crop((xx1, yy1, xx2, yy2))
+    if outw and outw > 0:
+        w, h = crop.size
+        outw = int(outw)
+        outh = max(1, int(round(h * (outw / float(w)))))
+        crop = crop.resize((outw, outh))
+    buf = io.BytesIO(); crop.save(buf, format="JPEG", quality=JPEG_QUALITY)
+    resp = make_response(buf.getvalue())
+    resp.headers["Content-Type"] = "image/jpeg"
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/health")

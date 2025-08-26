@@ -34,7 +34,7 @@
       const img = document.getElementById('snapshot');
       img.src = '/snapshot.jpg?ts=' + Date.now();
       // once it loads, refresh the detections list so indexes match the drawn image
-      img.onload = () => loadDetections();
+      img.onload = () => { loadDetections(); refreshCrop(); };
     }
     // Optional: auto-refresh snapshot every N seconds (set to 0 to disable)
     const SNAPSHOT_INTERVAL_SEC = 0;
@@ -44,6 +44,7 @@
         _timer = setInterval(refreshSnapshot, SNAPSHOT_INTERVAL_SEC * 1000);
       }
       loadDetections();
+      refreshCrop();
     });
 
     async function loadDetections() {
@@ -90,12 +91,21 @@
       });
       refreshSnapshot();
       await loadDetections();
+      refreshCrop();
     }
 
     async function clearSelection() {
       await fetch('/clear_selection', { method: 'POST' });
       refreshSnapshot();
       await loadDetections();
+      refreshCrop();
+    }
+
+    function refreshCrop() {
+      const crop = document.getElementById('crop');
+      if (!crop) return;
+      // pad=0.08 (8% around the box), size=256 px width
+      crop.src = '/selected_crop.jpg?pad=0.08&size=256&ts=' + Date.now();
     }
   </script>
 </head>
@@ -152,6 +162,12 @@
         <button type="button" onclick="clearSelection()">Clear</button>
       </div>
       <div id="selStatus" class="row-meta">Selected: (none)</div>
+
+      <div class="panel" style="margin-top:12px;">
+        <h2>Selected cut (crop)</h2>
+        <img id="crop" class="snapshot" src="/selected_crop.jpg?pad=0.08&size=256&ts={{model}}" alt="Selected crop preview" />
+        <div class="row-meta">Auto-updates after Snapshot/selection.</div>
+      </div>
     </div>
   </main>
 </body>
