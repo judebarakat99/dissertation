@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>CoppeliaSim vision (Top & Side) + Snapshot w/ ML</title>
+  <title>CoppeliaSim vision + ML masks + Centerline Suture</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>
     :root { --pad: 12px; }
@@ -11,114 +11,163 @@
     header h1 { margin:0; font-size: 18px; font-weight:600; }
     header .meta { font-size: 13px; opacity: 0.9; }
     header form { display:flex; align-items:center; gap:8px; }
-    select, button {
-      background:#1b2432; color:#e6edf3; border:1px solid #2a364b; border-radius:8px; padding:8px 10px;
-      font-size:14px;
+
+    select, input[type="number"], input[type="text"], button, input[type="color"] {
+      background:#1b2432; color:#e6edf3; border:1px solid #2a364b; border-radius:8px; padding:6px 8px; font-size:14px;
     }
+    input[type="range"] { width: 180px; }
     button { cursor:pointer; }
-    main { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; padding:16px; }
+    label { font-size:12px; color:#a7b6cc; }
+    .muted { opacity: .9; color:#9fb0c6; font-size:12px; }
+    main { display:grid; grid-template-columns: 1.2fr 1fr; gap: 16px; padding:16px; }
     .left-col { display:flex; flex-direction:column; gap:16px; }
     .panel { background:#0f1623; border:1px solid #1f2a3a; border-radius:12px; padding:12px; }
     .panel h2 { margin:0 0 8px 0; font-size:14px; font-weight:600; color:#a7b6cc; }
-    .panel img { width:100%; height:auto; border-radius:8px; display:block; background:#000; }
-    .right-col .controls { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; gap:8px; }
-    .right-col .controls h2 { margin:0; font-size:14px; font-weight:600; color:#a7b6cc; }
-    .right-col .snapshot { width:100%; aspect-ratio: 16/10; background:#000; border-radius:8px; border:1px solid #1f2a3a; object-fit:contain; }
-    .row-meta { font-size:12px; color:#9fb0c6; opacity:0.9; margin-top:4px; }
-    @media (max-width: 900px) {
+
+    .img-fit {
+      display:block;
+      width:100%;
+      height:auto;
+      max-height: 340px;
+      object-fit: contain;
+      background:#000;
+      border-radius:8px;
+    }
+
+    .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:8px; }
+    .row > div { display:flex; flex-direction:column; gap:6px; }
+    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .grid-3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; }
+    .controls { display:flex; flex-direction:column; gap:12px; margin-bottom:8px; }
+    .hr { height:1px; background:#1f2a3a; margin:6px 0; }
+    @media (max-width: 1300px) { .grid-3 { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 900px)  {
       main { grid-template-columns: 1fr; }
+      .grid-3 { grid-template-columns: 1fr; }
     }
   </style>
   <script>
-    function refreshSnapshot() {
-      const img = document.getElementById('snapshot');
-      img.src = '/snapshot.jpg?ts=' + Date.now();
-      // once it loads, refresh the detections list so indexes match the drawn image
-      img.onload = () => { loadDetections(); refreshCrop(); };
+    let currentDetId = null;
+
+    function qs(id){ return document.getElementById(id); }
+    function toHex(c){
+      if(!c) return "";
+      c = c.trim();
+      if(c[0] !== '#') c = '#' + c;
+      if(c.length === 4){ c = '#' + c[1]+c[1] + c[2]+c[2] + c[3]+c[3]; }
+      return c;
     }
-    // Optional: auto-refresh snapshot every N seconds (set to 0 to disable)
-    const SNAPSHOT_INTERVAL_SEC = 0;
-    let _timer = null;
-    window.addEventListener('load', () => {
-      if (SNAPSHOT_INTERVAL_SEC > 0) {
-        _timer = setInterval(refreshSnapshot, SNAPSHOT_INTERVAL_SEC * 1000);
-      }
-      loadDetections();
-      refreshCrop();
-    });
+    function cacheBust(url){ const j = url.includes('?') ? '&' : '?'; return url + j + 'ts=' + Date.now(); }
 
     async function loadDetections() {
-      try {
-        const res = await fetch('/detections');
-        const data = await res.json();
-        const sel = document.getElementById('detList');
-        const status = document.getElementById('selStatus');
-        sel.innerHTML = '';
-        if (!data || !Array.isArray(data.detections) || data.detections.length === 0) {
-          const opt = document.createElement('option');
-          opt.textContent = 'No detections';
-          opt.value = '';
-          sel.appendChild(opt);
-          status.textContent = data?.message || '—';
-          return;
-        }
-        data.detections.forEach(d => {
-          const opt = document.createElement('option');
-          const lab = d.label_name ?? ('id_'+d.label);
-          opt.value = d.id;
-          opt.textContent = `#${d.id} · ${lab} · ${d.score.toFixed(2)} · [${d.box.map(v=>Math.round(v)).join(', ')}]`;
-          sel.appendChild(opt);
-        });
-        if (typeof data.selected_id === 'number') {
-          sel.value = data.selected_id;
-          status.textContent = `Selected: #${data.selected_id}`;
-        } else {
-          status.textContent = 'Selected: (none)';
-        }
-      } catch (e) {
-        console.error(e);
+      const r = await fetch('/detections');
+      const data = await r.json();
+      const sel = qs('det-select');
+      sel.innerHTML = '';
+      if (!data.detections || data.detections.length === 0) {
+        const opt = document.createElement('option');
+        opt.text = '(no detections yet — click Snapshot)'; opt.value = '';
+        sel.add(opt);
+        currentDetId = null;
+        return;
       }
-    }
-
-    async function setSelection() {
-      const sel = document.getElementById('detList');
-      const id = sel.value;
-      if (id === '' || id == null) return;
-      await fetch('/select_cut', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: Number(id) }),
+      data.detections.forEach(d => {
+        const opt = document.createElement('option');
+        const lab = d.label_name || ('id_' + d.label);
+        opt.text = `#${d.id}  (${lab})  ${d.score.toFixed(2)}`;
+        opt.value = d.id;
+        sel.add(opt);
       });
+      const wanted = (data.selected_id !== null && data.selected_id !== undefined) ? data.selected_id : data.detections[0].id;
+      sel.value = wanted;
+      currentDetId = parseInt(wanted);
+    }
+
+    async function selectDetection(id){
+      if (id === null || id === '' || isNaN(+id)) return;
+      currentDetId = parseInt(id);
+      await fetch('/select_cut', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: currentDetId})});
+      refreshAll();
+    }
+
+    function buildSnapshotURL(){
+      const polyColor = toHex(qs('poly-color').value);
+      const polyWidth = qs('poly-width').value;
+      return cacheBust(`/snapshot.jpg?poly_color=${encodeURIComponent(polyColor)}&poly_width=${encodeURIComponent(polyWidth)}`);
+    }
+    function buildCropURL(){
+      const pad = qs('pad').value;
+      const size = qs('crop-size').value;
+      let url = `/selected_crop.jpg?id=${encodeURIComponent(currentDetId)}&pad=${encodeURIComponent(pad)}`;
+      if (size) url += `&size=${encodeURIComponent(size)}`;
+      return cacheBust(url);
+    }
+    function buildMaskURL(){
+      const pad = qs('pad').value;
+      const size = qs('crop-size').value;
+      let url = `/mask.jpg?id=${encodeURIComponent(currentDetId)}&pad=${encodeURIComponent(pad)}`;
+      if (size) url += `&size=${encodeURIComponent(size)}`;
+      return cacheBust(url);
+    }
+    function buildPatternURL(){
+      const pad = qs('pad').value;
+      const size = qs('crop-size').value;
+      const spacing = qs('spacing').value;      // used as alpha
+      const bite = qs('bite').value;
+      const sMin = qs('s-min').value;
+      const sMax = qs('s-max').value;
+      const threadColor = toHex(qs('thread-color').value);
+      const threadThick = qs('thread-thick').value;
+      const style = qs('pattern-style').value; // continuous|perp
+      let url = `/pattern.jpg?id=${encodeURIComponent(currentDetId)}&pad=${encodeURIComponent(pad)}&spacing=${encodeURIComponent(spacing)}`;
+      url += `&bite=${encodeURIComponent(bite)}&pattern=${encodeURIComponent(style)}`;
+      url += `&s_min=${encodeURIComponent(sMin)}&s_max=${encodeURIComponent(sMax)}`;
+      url += `&thread_color=${encodeURIComponent(threadColor)}&thread_thick=${encodeURIComponent(threadThick)}`;
+      if (size) url += `&size=${encodeURIComponent(size)}`;
+      return cacheBust(url);
+    }
+
+    function refreshSnapshot(){ qs('snapshot').src = buildSnapshotURL(); }
+    function refreshCrop(){ if(currentDetId!==null) qs('crop').src = buildCropURL(); }
+    function refreshMask(){ if(currentDetId!==null) qs('mask').src = buildMaskURL(); }
+    function refreshPattern(){ if(currentDetId!==null) qs('pattern').src = buildPatternURL(); }
+
+    async function refreshAll(){
       refreshSnapshot();
       await loadDetections();
       refreshCrop();
+      refreshMask();
+      refreshPattern();
     }
 
-    async function clearSelection() {
-      await fetch('/clear_selection', { method: 'POST' });
-      refreshSnapshot();
-      await loadDetections();
-      refreshCrop();
-    }
+    async function onPageLoad(){
+      qs('crop-size').value = 320; // compact preview
+      qs('s-min').value = 8;
+      qs('s-max').value = 60;
+      await refreshAll();
 
-    function refreshCrop() {
-      const crop = document.getElementById('crop');
-      if (!crop) return;
-      // pad=0.08 (8% around the box), size=256 px width
-      crop.src = '/selected_crop.jpg?pad=0.08&size=256&ts=' + Date.now();
+      qs('det-select').addEventListener('change', (e)=> selectDetection(e.target.value));
+      ['pad','crop-size','spacing','bite','thread-color','thread-thick','pattern-style','s-min','s-max'].forEach(id=>{
+        qs(id).addEventListener('input', ()=>{ refreshCrop(); refreshMask(); refreshPattern(); });
+      });
+      ['poly-color','poly-width'].forEach(id=>{
+        qs(id).addEventListener('input', refreshSnapshot);
+      });
+      qs('btn-snapshot').addEventListener('click', refreshAll);
     }
+    window.addEventListener('load', onPageLoad);
   </script>
 </head>
 <body>
   <header>
     <div>
-      <h1>CoppeliaSim vision stream (Top & Side)</h1>
+      <h1>CoppeliaSim vision (Top & Side) + ML mask + Centerline Suture</h1>
       <div class="meta">
-        Top sensor: {{ top_sensor }} • Side sensor: {{ side_sensor }} • ZMQ: {{ host }}:{{ port }}
+        Top: {{ top_sensor }} • Side: {{ side_sensor }} • ZMQ: {{ host }}:{{ port }}
       </div>
     </div>
 
-    <form method="POST" action="/select_model">
+    <form method="POST" action="/select_model" title="Switch ML model">
       <label for="weights">Model:&nbsp;</label>
       <select name="weights" id="weights">
         {% for w in models %}
@@ -130,43 +179,123 @@
   </header>
 
   <main>
-    <!-- LEFT COLUMN: Top and Side raw streams -->
+    <!-- LEFT: live raw streams -->
     <div class="left-col">
       <div class="panel">
         <h2>Top view</h2>
-        <img src="/stream_raw/top" alt="Top view stream"/>
-        <div class="row-meta">Live raw feed from {{ top_sensor }}</div>
+        <img class="img-fit" src="/stream_raw/top" alt="Top view stream"/>
+        <div class="muted">Live raw feed from {{ top_sensor }}</div>
       </div>
 
       <div class="panel">
         <h2>Side view</h2>
-        <img src="/stream_raw/side" alt="Side view stream"/>
-        <div class="row-meta">Live raw feed from {{ side_sensor }}</div>
+        <img class="img-fit" src="/stream_raw/side" alt="Side view stream"/>
+        <div class="muted">Live raw feed from {{ side_sensor }}</div>
       </div>
     </div>
 
-    <!-- RIGHT COLUMN: Snapshot with detections -->
-    <div class="right-col panel">
+    <!-- RIGHT: controls + outputs -->
+    <div class="panel">
+      <h2>Controls</h2>
       <div class="controls">
-        <h2>Snapshot with detection overlays (from Top view)</h2>
-        <button type="button" onclick="refreshSnapshot()">Snapshot</button>
-      </div>
-      <img id="snapshot" class="snapshot" src="/snapshot.jpg?ts={{model}}" alt="Snapshot with overlays"/>
-      <div class="row-meta">Current model: {{ model }}</div>
+        <div class="grid-2">
+          <div>
+            <div class="row">
+              <div>
+                <label>Detection</label>
+                <select id="det-select"></select>
+              </div>
+              <div>
+                <label>Crop pad (rel)</label>
+                <input type="number" id="pad" step="0.01" value="0.08" min="0" max="0.5">
+              </div>
+              <div>
+                <label>Crop width (px)</label>
+                <input type="number" id="crop-size" step="1" placeholder="(auto)">
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="row">
+              <div>
+                <label>Curvature weight α</label>
+                <input type="range" id="spacing" min="10" max="300" step="2" value="180">
+              </div>
+              <div>
+                <label>Bite depth (0..1.8)</label>
+                <input type="range" id="bite" min="0.3" max="1.8" step="0.01" value="0.90">
+              </div>
+              <div>
+                <label>Pattern</label>
+                <select id="pattern-style">
+                  <option value="continuous" selected>continuous (centerline)</option>
+                  <option value="perp">perpendicular</option>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>Min spacing (px)</label>
+                <input type="number" id="s-min" min="4" max="60" step="1" value="8">
+              </div>
+              <div>
+                <label>Max spacing (px)</label>
+                <input type="number" id="s-max" min="20" max="120" step="1" value="60">
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>Thread color</label>
+                <input type="color" id="thread-color" value="#1ed5ff">
+              </div>
+              <div>
+                <label>Thread thickness</label>
+                <input type="range" id="thread-thick" min="1" max="6" step="1" value="2">
+              </div>
+            </div>
+          </div>
 
-      <hr style="border:none;border-top:1px solid #1f2a3a; margin:12px 0;">
-      <div class="controls" style="gap:8px; flex-wrap:wrap;">
-        <h2 style="margin-right:auto;">Pick a cut</h2>
-        <select id="detList" style="min-width:260px;"></select>
-        <button type="button" onclick="setSelection()">Set active</button>
-        <button type="button" onclick="clearSelection()">Clear</button>
+          <div>
+            <div class="row">
+              <div>
+                <label>Polygon color (snapshot)</label>
+                <input type="color" id="poly-color" value="#00dcdc">
+              </div>
+              <div>
+                <label>Polygon width</label>
+                <input type="range" id="poly-width" min="1" max="8" step="1" value="3">
+              </div>
+            </div>
+            <div class="muted">Tip: click <em>Snapshot</em> after moving the scene. The crop is auto-widened horizontally to leave room for entry/exit points outside the cut.</div>
+            <div class="row">
+              <button type="button" id="btn-snapshot">Snapshot</button>
+            </div>
+          </div>
+        </div>
       </div>
-      <div id="selStatus" class="row-meta">Selected: (none)</div>
 
-      <div class="panel" style="margin-top:12px;">
-        <h2>Selected cut (crop)</h2>
-        <img id="crop" class="snapshot" src="/selected_crop.jpg?pad=0.08&size=256&ts={{model}}" alt="Selected crop preview" />
-        <div class="row-meta">Auto-updates after Snapshot/selection.</div>
+      <!-- Snapshot preview -->
+      <div class="panel">
+        <h2>Snapshot (mask polygons + widened boxes)</h2>
+        <img id="snapshot" class="img-fit" alt="Snapshot with overlays"/>
+        <div class="muted">Model: {{ model }}</div>
+      </div>
+
+      <!-- Three compact previews: crop, mask, pattern -->
+      <div class="grid-3">
+        <div class="panel">
+          <h2>Selected crop</h2>
+          <img id="crop" class="img-fit" alt="Selected crop"/>
+        </div>
+
+        <div class="panel">
+          <h2>Selected mask (crop)</h2>
+          <img id="mask" class="img-fit" alt="Selected mask"/>
+        </div>
+
+        <div class="panel">
+          <h2>Suture pattern (over crop)</h2>
+          <img id="pattern" class="img-fit" alt="Pattern over crop"/>
+        </div>
       </div>
     </div>
   </main>

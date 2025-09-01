@@ -5,21 +5,20 @@ import os
 import io
 import time
 import threading
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import numpy as np
 import cv2
-from flask import Flask, Response, render_template, abort, make_response, request, redirect, url_for
-from flask import jsonify
+from flask import Flask, Response, render_template, abort, make_response, request, redirect, url_for, jsonify
 from ament_index_python.packages import get_package_share_directory
 
-# ---- ZMQ Remote API client (fixed to port 23000) ----
+# ---- ZMQ Remote API client ----
 try:
     from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 except ImportError:
     from zmqRemoteApi import RemoteAPIClient  # legacy
 
-# ---- Torch / torchvision (for detection snapshot) ----
+# ---- Torch / torchvision ----
 try:
     import torch
     import torchvision
@@ -31,33 +30,37 @@ except Exception as e:
     TORCH_OK = False
     _TORCH_ERR = str(e)
 
-# ---------------- Configuration ----------------
+# ---- Stitching ----
+try:
+    from . import stitching
+except Exception:
+    import stitching
+
+
+# ====================== Configuration ======================
+
 CSIM_HOST = "127.0.0.1"
 CSIM_PORT = 23000
 
-TOP_SENSOR_ALIAS  = "/visionSensor"
+TOP_SENSOR_ALIAS = "/visionSensor"
 SIDE_SENSOR_ALIAS = "/visionSensor_SideView"
 
 FPS = 15
 JPEG_QUALITY = 90
 
-# Snapshot capture (right panel) uses stepped mode for stability.
 STEPPED_SNAPSHOT = 1
-# RAW streams (left column) use non-stepped readers like the older working version.
 STEPPED_RAW = 0
-# ------------------------------------------------
 
 
-# ---------------- Template & models directories ----------------
+# ====================== Templates & models ======================
+
 def _find_templates_dir() -> str:
     env = os.getenv("SUTURE_ARM_TEMPLATES", "")
-    if env and os.path.isdir(env):
-        return env
+    if env and os.path.isdir(env): return env
     try:
         share = get_package_share_directory("suture_arm")
         tdir = os.path.join(share, "templates")
-        if os.path.isdir(tdir):
-            return tdir
+        if os.path.isdir(tdir): return tdir
     except Exception:
         pass
     here = os.path.dirname(__file__)
@@ -66,13 +69,11 @@ def _find_templates_dir() -> str:
 
 def _find_models_root() -> str:
     env = os.getenv("SUTURE_ARM_ML", "")
-    if env and os.path.isdir(env):
-        return env
+    if env and os.path.isdir(env): return env
     try:
         share = get_package_share_directory("suture_arm")
         mdir = os.path.join(share, "ml")
-        if os.path.isdir(mdir):
-            return mdir
+        if os.path.isdir(mdir): return mdir
     except Exception:
         pass
     here = os.path.dirname(__file__)
@@ -91,50 +92,38 @@ if not os.path.isfile(os.path.join(TEMPLATES_DIR, "index.html")):
 app = Flask(__name__, template_folder=TEMPLATES_DIR)
 
 
-# ---------------- Snapshot vision capture (background thread) ----------------
+# ====================== Snapshot capture thread ======================
+
 class FrameGrabber:
-    """Background grabber for TOP sensor frames used by the snapshot detection."""
     def __init__(self, host: str, port: int, sensor_alias: str):
-        self.host = host
-        self.port = port
-        self.sensor_alias = sensor_alias
-        self.client = None
-        self.sim = None
-        self.sensor = None
-        self._last = None  # (bgr, ts)
+        self.host = host; self.port = port; self.sensor_alias = sensor_alias
+        self.client = None; self.sim = None; self.sensor = None
+        self._last = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
 
     def _resolve(self, alias: str) -> Optional[int]:
-        for cand in (alias, alias.lstrip('/'), alias + '#0'):
-            try:
-                return self.sim.getObject(cand)
-            except Exception:
-                pass
+        for cand in (alias, alias.lstrip("/"), alias + "#0"):
+            try: return self.sim.getObject(cand)
+            except Exception: pass
         return None
 
     def _connect(self):
         self.client = RemoteAPIClient(self.host, self.port)
-        self.sim = self.client.require('sim')
+        self.sim = self.client.require("sim")
         self.sensor = self._resolve(self.sensor_alias)
         if self.sensor is None:
             raise RuntimeError(f"Vision sensor '{self.sensor_alias}' not found")
-
-        # Start if needed
         try:
             st = self.sim.getSimulationState()
             if st in (self.sim.simulation_stopped, self.sim.simulation_paused):
                 self.sim.startSimulation()
         except Exception:
             pass
-
-        # Stepping for stable snapshot grabs
         if STEPPED_SNAPSHOT and hasattr(self.sim, "setStepping"):
-            try:
-                self.sim.setStepping(True)
-            except Exception:
-                pass
+            try: self.sim.setStepping(True)
+            except Exception: pass
 
     def _decode(self, img, w, h) -> np.ndarray:
         buf = np.frombuffer(img, dtype=np.uint8) if isinstance(img, (bytes, bytearray)) else np.array(img, dtype=np.uint8)
@@ -161,44 +150,33 @@ class FrameGrabber:
                 self.sim.handleVisionSensor(self.sensor)
         except Exception:
             pass
-
         if STEPPED_SNAPSHOT and hasattr(self.sim, "setStepping"):
-            try:
-                self.sim.step()
-            except Exception:
-                pass
-
-        # Robust fetch across API variants
+            try: self.sim.step()
+            except Exception: pass
         try:
             img, res = self.sim.getVisionSensorImg(self.sensor)  # bytes, [w,h]
             w, h = int(res[0]), int(res[1])
-        except Exception:
+        except Exception as e1:
             try:
-                img, w, h = self.sim.getVisionSensorCharImage(self.sensor)
-            except Exception as e1:
-                try:
-                    out = self.sim.getVisionSensorImage(self.sensor)
-                    if isinstance(out, (list, tuple)) and len(out) == 3 and isinstance(out[1], (int, float)):
-                        img, w, h = out; w, h = int(w), int(h)
-                    else:
-                        img, res = out; w, h = int(res[0]), int(res[1])
-                    if isinstance(img, (list, tuple, np.ndarray)) and not isinstance(img, (bytes, bytearray)):
-                        arr = np.array(img, dtype=np.float32)
-                        img = (arr * 255).clip(0, 255).astype(np.uint8).tobytes()
-                except Exception as e2:
-                    raise RuntimeError(f"getVisionSensor* failed: {e1} / {e2}")
-
+                out = self.sim.getVisionSensorImage(self.sensor)
+                if isinstance(out, (list, tuple)) and len(out) == 3 and isinstance(out[1], (int, float)):
+                    img, w, h = out; w, h = int(w), int(h)
+                else:
+                    img, res = out; w, h = int(res[0]), int(res[1])
+                if isinstance(img, (list, tuple, np.ndarray)) and not isinstance(img, (bytes, bytearray)):
+                    arr = np.array(img, dtype=np.float32)
+                    img = (arr * 255).clip(0, 255).astype(np.uint8).tobytes()
+            except Exception as e2:
+                raise RuntimeError(f"getVisionSensor* failed: {e1} / {e2}")
         return self._decode(img, w, h)
 
     def _loop(self):
         period = 1.0 / max(1, FPS)
         while not self._stop.is_set():
             try:
-                if self.sim is None:
-                    self._connect()
+                if self.sim is None: self._connect()
                 frame = self._read_frame()
-                with self._lock:
-                    self._last = (frame, time.time())
+                with self._lock: self._last = (frame, time.time())
             except Exception as e:
                 print(f"[vision_web][ERR] snapshot capture: {e}", flush=True)
                 time.sleep(0.1)
@@ -211,85 +189,67 @@ class FrameGrabber:
 
     def get_frame(self) -> Optional[np.ndarray]:
         with self._lock:
-            if self._last is None:
-                return None
+            if self._last is None: return None
             return self._last[0].copy()
 
 
 grabber = FrameGrabber(CSIM_HOST, CSIM_PORT, TOP_SENSOR_ALIAS)
 
 
-# ---------------- Legacy RAW readers for top & side streams ----------------
-_raw_ctx = {}  # alias -> {"client":..., "sim":..., "sensor":...}
+# ====================== RAW readers (Top/Side) ======================
+
+_raw_ctx: Dict[str, Dict] = {}
 
 def _raw_connect(alias: str):
-    if alias in _raw_ctx and _raw_ctx[alias].get("sim") and _raw_ctx[alias].get("sensor"):
-        return
+    if alias in _raw_ctx and _raw_ctx[alias].get("sim") and _raw_ctx[alias].get("sensor"): return
     client = RemoteAPIClient(CSIM_HOST, CSIM_PORT)
-    sim = client.require('sim')
-
+    sim = client.require("sim")
     sensor = None
-    for cand in (alias, alias.lstrip('/'), alias + '#0'):
-        try:
-            sensor = sim.getObject(cand)
-            break
-        except Exception:
-            pass
+    for cand in (alias, alias.lstrip("/"), alias + "#0"):
+        try: sensor = sim.getObject(cand); break
+        except Exception: pass
     if sensor is None:
         raise RuntimeError(f"RAW: vision sensor '{alias}' not found")
-
-    # Ensure simulation is running, but do NOT enable stepping here
     try:
         st = sim.getSimulationState()
-        if st in (sim.simulation_stopped, sim.simulation_paused):
-            sim.startSimulation()
+        if st in (sim.simulation_stopped, sim.simulation_paused): sim.startSimulation()
     except Exception:
         pass
-
     _raw_ctx[alias] = {"client": client, "sim": sim, "sensor": sensor}
 
 
 def _raw_read_once(alias: str) -> np.ndarray:
-    ctx = _raw_ctx[alias]
-    sim = ctx["sim"]; sensor = ctx["sensor"]
-
+    ctx = _raw_ctx[alias]; sim = ctx["sim"]; sensor = ctx["sensor"]
     try:
         if bool(sim.getObjectInt32Param(sensor, sim.visionintparam_explicit_handling)):
             sim.handleVisionSensor(sensor)
     except Exception:
         pass
-
-    # Prefer the CharImage API first (what worked before)
     try:
-        img, w, h = sim.getVisionSensorCharImage(sensor)
+        img, res = sim.getVisionSensorImg(sensor)  # bytes, [w,h]
+        w, h = int(res[0]), int(res[1])
     except Exception:
-        try:
-            img, res = sim.getVisionSensorImg(sensor)  # bytes, [w,h]
-            w, h = int(res[0]), int(res[1])
-        except Exception:
-            out = sim.getVisionSensorImage(sensor)
-            if isinstance(out, (list, tuple)) and len(out) == 3 and isinstance(out[1], (int, float)):
-                img, w, h = out; w, h = int(w), int(h)
-            else:
-                img, res = out; w, h = int(res[0]), int(res[1])
-            if isinstance(img, (list, tuple, np.ndarray)) and not isinstance(img, (bytes, bytearray)):
-                arr = np.array(img, dtype=np.float32)
-                img = (arr * 255).clip(0, 255).astype(np.uint8).tobytes()
-
-    buf = np.frombuffer(img, dtype=np.uint8) if isinstance(img, (bytes, bytearray)) else np.array(img, dtype=np.uint8)
-    n = buf.size
-
-    if n % 3 == 0:
-        frame = np.flip(buf.reshape(h, w, 3), 0)[:, :, ::-1]
-    elif n == w * h:
+        out = sim.getVisionSensorImage(sensor)
+        if isinstance(out, (list, tuple)) and len(out) == 3 and isinstance(out[1], (int, float)):
+            img, w, h = out; w, h = int(w), int(h)
+        else:
+            img, res = out; w, h = int(res[0]), int(res[1])
+        if isinstance(img, (list, tuple, np.ndarray)) and not isinstance(img, (bytes, bytearray)):
+            arr = np.array(img, dtype=np.float32)
+            img = (arr * 255).clip(0, 255).astype(np.uint8).tobytes()
+    buf = np.frombuffer(img, dtype=np.uint8); n = buf.size
+    if n == w*h:
         frame = cv2.cvtColor(np.flip(buf.reshape(h, w), 0), cv2.COLOR_GRAY2BGR)
+    elif n == w*h*3:
+        frame = np.flip(buf.reshape(h, w, 3), 0)[:, :, ::-1]
+    elif n == w*h*4:
+        frame = np.flip(buf.reshape(h, w, 4), 0)[:, :, :3][:, :, ::-1]
     else:
         if (w*h) and n % (w*h) == 0:
             c = n // (w*h)
             frame = np.flip(buf.reshape(h, w, c), 0)[:, :, :3][:, :, ::-1]
         else:
             raise RuntimeError(f"RAW({alias}): unexpected buffer size n={n} vs {w}x{h}")
-
     if not (frame.flags["C_CONTIGUOUS"] and frame.flags["WRITEABLE"]):
         frame = np.ascontiguousarray(frame.copy())
     return frame
@@ -297,106 +257,87 @@ def _raw_read_once(alias: str) -> np.ndarray:
 
 def _encode_jpeg(bgr: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
     ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        raise RuntimeError("cv2.imencode failed")
+    if not ok: raise RuntimeError("cv2.imencode failed")
     return enc.tobytes()
 
 
 def mjpeg_generator_raw(alias: str):
-    # Connect once per alias, read each frame freshly
     try:
         _raw_connect(alias)
     except Exception as e:
         msg = np.zeros((240, 320, 3), np.uint8)
-        cv2.putText(msg, f"RAW connect error: {e}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _encode_jpeg(msg) + b"\r\n")
-        return
-
+        cv2.putText(msg, f"RAW connect error: {e}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _encode_jpeg(msg) + b"\r\n"); return
     period = 1.0 / max(1, FPS)
     while True:
         try:
-            frame = _raw_read_once(alias)
-            jpg = _encode_jpeg(frame)
+            frame = _raw_read_once(alias); jpg = _encode_jpeg(frame)
         except Exception as e:
             err = np.zeros((240, 320, 3), np.uint8)
-            cv2.putText(err, f"RAW error: {str(e)[:40]}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
-            jpg = _encode_jpeg(err)
-            time.sleep(0.1)
+            cv2.putText(err, f"RAW error: {str(e)[:40]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+            jpg = _encode_jpeg(err); time.sleep(0.1)
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
         time.sleep(period)
 
 
-# ---------------- Detection: load + run (snapshot) ----------------
-def _try_import_training_model(weights_path: str):
-    """
-    Try to import a model-builder that matches the weights file.
-    Priority:
-      1) <stem>.py sitting next to <stem>.pth   (e.g., mask_cuts_detector3.[pth|py])
-      2) train_cuts_detector.py                 (legacy)
-    Returns a callable (factory) or an already-instantiated model.
-    """
-    import importlib.util
+# ====================== Detection & masks ======================
 
+def _try_import_training_model(weights_path: str):
+    import importlib.util
     wdir = os.path.dirname(weights_path)
     stem = os.path.splitext(os.path.basename(weights_path))[0]
-
-    candidate_modules = [
+    candidates = [
         os.path.join(wdir, f"{stem}.py"),
         os.path.join(wdir, "train_cuts_detector.py"),
     ]
-
-    factories = (
-        "get_model", "create_model", "build_model", "make_model",
-        "get_detector", "create_detector",
-    )
+    factories = ("get_model", "create_model", "build_model", "make_model", "get_detector", "create_detector")
     classes = ("Model", "Detector")
-
-    for module_path in candidate_modules:
-        if not os.path.isfile(module_path):
-            continue
+    for module_path in candidates:
+        if not os.path.isfile(module_path): continue
         spec = importlib.util.spec_from_file_location(f"mdl_{stem}", module_path)
         mod = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(mod)
-
-        # 1) explicit factory names
         for name in factories:
             fn = getattr(mod, name, None)
-            if callable(fn):
-                return fn
-        # 2) common class names that construct without args
+            if callable(fn): return fn
         for cname in classes:
             cls = getattr(mod, cname, None)
-            if cls is not None:
-                try:
-                    return cls  # will be called like a factory below
-                except Exception:
-                    pass
-        # 3) direct model object
+            if cls is not None: return cls
         mdl = getattr(mod, "model", None)
-        if mdl is not None:
-            return lambda **_: mdl
+        if mdl is not None: return lambda **_: mdl
     return None
 
 
 def _pick_font(size: int = 16):
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    try: return ImageFont.truetype("DejaVuSans.ttf", size=size)
     except Exception:
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=size)
-        except Exception:
-            return None
+        try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=size)
+        except Exception: return None
 
 
-def _build_fallback_model(num_classes: int = 2):
-    return torchvision.models.detection.fasterrcnn_resnet50_fpn(
-        weights=None,
-        weights_backbone="IMAGENET1K_V1",
-        num_classes=num_classes
-    )
+def _guess_wants_masks(weights_path: str, ckpt: dict) -> bool:
+    name = os.path.basename(weights_path).lower()
+    if "mask" in name or "maskrcnn" in name:
+        return True
+    state = ckpt.get("model", None) or ckpt.get("state_dict", None) or ckpt
+    try:
+        for k in state.keys():
+            if "mask" in k.lower(): return True
+    except Exception:
+        pass
+    return False
+
+
+def _build_fallback_model(num_classes: int, want_masks: bool):
+    if want_masks:
+        return torchvision.models.detection.maskrcnn_resnet50_fpn(
+            weights=None, weights_backbone="IMAGENET1K_V1", num_classes=num_classes
+        )
+    else:
+        return torchvision.models.detection.fasterrcnn_resnet50_fpn(
+            weights=None, weights_backbone="IMAGENET1K_V1", num_classes=num_classes
+        )
 
 
 def _load_detector(weights_path: str):
@@ -407,13 +348,10 @@ def _load_detector(weights_path: str):
     if isinstance(ckpt, dict):
         for key in ("classes", "class_names", "names", "labels"):
             if key in ckpt and isinstance(ckpt[key], (list, tuple)):
-                class_names = list(ckpt[key])
-                break
+                class_names = list(ckpt[key]); break
         if class_names is None:
-            # support dict mapping {class_name: idx}
             cti = ckpt.get("class_to_idx")
             if isinstance(cti, dict) and len(cti) > 0:
-                # sort by index to get a stable list
                 inv = sorted(cti.items(), key=lambda kv: int(kv[1]))
                 class_names = [k for k, _ in inv]
 
@@ -422,37 +360,23 @@ def _load_detector(weights_path: str):
     if ctor:
         try:
             if class_names:
-                if class_names and class_names[0].lower() in ("__background__", "background", "bg"):
-                    num_classes = len(class_names)
-                else:
-                    num_classes = len(class_names) + 1
+                num_classes = len(class_names) if class_names[0].lower() in ("__background__", "background", "bg") else len(class_names) + 1
             else:
                 num_classes = 2
-            try:
-                model = ctor(num_classes=num_classes)
-            except TypeError:
-                model = ctor()
+            try: model = ctor(num_classes=num_classes)
+            except TypeError: model = ctor()
         except Exception as e:
             print(f"[vision_web][WARN] train ctor failed: {e}")
 
     if model is None:
         if class_names:
-            if class_names and class_names[0].lower() in ("__background__", "background", "bg"):
-                num_classes = len(class_names)
-            else:
-                num_classes = len(class_names) + 1
+            num_classes = len(class_names) if class_names[0].lower() in ("__background__", "background", "bg") else len(class_names) + 1
         else:
-            class_names = ["__background__", "cut"]
-            num_classes = 2
-        model = _build_fallback_model(num_classes=num_classes)
+            class_names = ["__background__", "cut"]; num_classes = 2
+        want_masks = _guess_wants_masks(weights_path, ckpt if isinstance(ckpt, dict) else {})
+        model = _build_fallback_model(num_classes=num_classes, want_masks=want_masks)
 
-    # Accept a variety of checkpoint layouts
-    state = (
-        ckpt.get("model", None)
-        or ckpt.get("model_state_dict", None)
-        or ckpt.get("state_dict", None)
-        or ckpt
-    )
+    state = ckpt.get("model", None) or ckpt.get("model_state_dict", None) or ckpt.get("state_dict", None) or ckpt
     try:
         new_state = {k.replace("module.", ""): v for k, v in state.items()}
         model.load_state_dict(new_state, strict=False)
@@ -461,105 +385,211 @@ def _load_detector(weights_path: str):
         model.load_state_dict(state, strict=False)
 
     model.eval().to(device)
+    has_mask = any("mask" in n.lower() for n, _ in model.named_modules())
+    print(f"[vision_web] model loaded. mask_head={has_mask}", flush=True)
     return model, class_names, device
 
 
-def _draw_detections_pil(
-    img_pil: "Image.Image",
-    boxes: "torch.Tensor",
-    scores: "torch.Tensor",
-    labels: "torch.Tensor",
-    class_names: List[str],
-    selected_index: int | None = None,
-) -> "Image.Image":
-    draw = ImageDraw.Draw(img_pil)
-    font = _pick_font(16)
-    for idx, (box, score, label) in enumerate(zip(boxes, scores, labels)):
-        x1, y1, x2, y2 = [float(v) for v in box.tolist()]
-        # base color from label; highlight selected with a bright color & thicker stroke
-        color = (80, 180, 255) if (selected_index is not None and idx == selected_index) \
-                else tuple(int((hash(int(label)) >> (i * 8)) & 255) for i in range(3))
-        width = 5 if (selected_index is not None and idx == selected_index) else 3
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
-        lid = int(label)
-        cls_name = class_names[lid] if 0 <= lid < len(class_names) else f"id_{lid}"
-        text = f"{cls_name} {float(score):.2f}"
-        if font:
-            tw, th = draw.textbbox((0, 0), text, font=font)[2:]
-        else:
-            tw, th = (8 * len(text), 14)
-        pad = 2
-        draw.rectangle([x1, y1 - th - 2 * pad, x1 + tw + 2 * pad, y1], fill=color)
-        draw.text((x1 + pad, y1 - th - pad), text, fill=(255, 255, 255), font=font)
-        # draw a small tag with the numeric index for easy reference
-        idx_text = f"#{idx}"
-        if font:
-            itw, ith = draw.textbbox((0,0), idx_text, font=font)[2:]
-        else:
-            itw, ith = (12, 12)
-        tag_pad = 2
-        draw.rectangle([x1, y1, x1 + itw + 2*tag_pad, y1 + ith + 2*tag_pad], fill=(0,0,0))
-        draw.text((x1 + tag_pad, y1 + tag_pad), idx_text, fill=(255,255,255), font=font)
-    return img_pil
+# -------- Robust mask extraction --------
+
+MASK_BIN_THR = 0.5  # threshold after sigmoid if logits are provided
+
+def _to_numpy_uint8_mask(m: "torch.Tensor") -> np.ndarray:
+    import torch
+    if isinstance(m, (list, tuple)):
+        m = torch.stack([torch.as_tensor(x) for x in m], dim=0)
+    t = torch.as_tensor(m)
+    if t.dtype == torch.bool:
+        t = t.to(dtype=torch.uint8) * 255
+        if t.dim() == 2: t = t.unsqueeze(0)
+        if t.dim() == 4 and t.shape[1] == 1: t = t[:, 0]
+        return t.detach().cpu().numpy()
+    if t.dtype.is_floating_point and (t.min() < 0 or t.max() > 1):
+        t = t.sigmoid()
+    if t.dim() == 2: t = t.unsqueeze(0)
+    elif t.dim() == 4:
+        if t.shape[1] == 1: t = t[:, 0]
+        else: t, _ = t.max(dim=1)
+    t = (t >= MASK_BIN_THR).to(dtype=torch.uint8) * 255
+    return t.detach().cpu().numpy()
 
 
 @torch.inference_mode()
-def _run_inference_on_frame(
-    model, device, frame_bgr: np.ndarray,
-    conf_thresh: float = 0.4,
-    iou_thresh: float = 0.5
-) -> Tuple["Image.Image", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+def _run_inference_on_frame(model, device, frame_bgr: np.ndarray, conf_thresh: float = 0.4, iou_thresh: float = 0.5):
     img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img_pil = Image.fromarray(img_rgb)
     tens = F.to_tensor(img_pil).to(device)
-    outputs = model([tens])[0]
-    boxes = outputs.get("boxes", torch.empty((0, 4), device=device))
-    scores = outputs.get("scores", torch.empty((0,), device=device))
-    labels = outputs.get("labels", torch.empty((0,), dtype=torch.long, device=device))
 
-    keep = scores >= conf_thresh
-    boxes = boxes[keep]; scores = scores[keep]; labels = labels[keep]
+    out = model([tens])
+    outputs = out[0] if isinstance(out, (list, tuple)) else out
+
+    is_dict = isinstance(outputs, dict)
+    boxes  = outputs.get("boxes",  None) if is_dict else None
+    scores = outputs.get("scores", None) if is_dict else None
+    labels = outputs.get("labels", None) if is_dict else None
+
+    masks = None
+    if is_dict:
+        for k in ("masks", "pred_masks", "mask", "segmentation", "segm", "probs_mask"):
+            if k in outputs: masks = outputs[k]; break
+    try:
+        if masks is None and hasattr(outputs, "get_fields"):
+            fields = outputs.get_fields()
+            if "pred_masks" in fields: masks = fields["pred_masks"]
+            boxes  = boxes  if boxes  is not None else fields.get("pred_boxes", None)
+            scores = scores if scores is not None else fields.get("scores", None)
+            labels = labels if labels is not None else fields.get("pred_classes", None)
+    except Exception:
+        pass
+
+    def _to_tensor(x, default_shape=()):
+        try: return torch.as_tensor(x)
+        except Exception:
+            try: return torch.as_tensor(x.tensor)
+            except Exception: return torch.empty(default_shape)
+
+    boxes  = _to_tensor(boxes, (0, 4))
+    scores = _to_tensor(scores, (0,))
+    labels = _to_tensor(labels, (0,)).to(dtype=torch.long)
+
+    keep = (scores >= conf_thresh)
+    if keep.numel() > 0:
+        boxes = boxes[keep]; scores = scores[keep]; labels = labels[keep]
+        if masks is not None:
+            try: masks = masks[keep]
+            except Exception:
+                if isinstance(masks, (list, tuple)):
+                    masks = [m for m, k in zip(masks, keep.tolist()) if k]
 
     if boxes.numel() > 0:
         keep_idx = nms(boxes, scores, iou_thresh)
-        boxes = boxes[keep_idx]; scores = scores[keep_idx]; labels = labels[keep_idx]
-    return img_pil, boxes.cpu(), scores.cpu(), labels.cpu()
+        boxes  = boxes[keep_idx]; scores = scores[keep_idx]; labels = labels[keep_idx]
+        if masks is not None:
+            try: masks = masks[keep_idx]
+            except Exception:
+                if isinstance(masks, (list, tuple)):
+                    masks = [masks[i] for i in keep_idx.tolist()]
+
+    masks_np = None
+    if masks is not None:
+        try:
+            masks_np = _to_numpy_uint8_mask(masks)
+        except Exception as e:
+            print(f"[vision_web][WARN] mask extraction failed: {e}", flush=True)
+            masks_np = None
+
+    return img_pil, boxes.cpu(), scores.cpu(), labels.cpu(), masks_np
 
 
-def _encode_pil_jpeg(img_pil: "Image.Image", quality: int = JPEG_QUALITY) -> bytes:
+def _parse_hex_color(s: Optional[str], default=(0, 220, 220)) -> Tuple[int, int, int]:
+    if not s: return default
+    try:
+        s = s.strip()
+        if s.startswith('#'): s = s[1:]
+        if len(s) == 3: s = ''.join([ch * 2 for ch in s])
+        if len(s) != 6: return default
+        r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
+        return (r, g, b)
+    except Exception:
+        return default
+
+
+def _draw_detections_pil(img_pil, boxes, scores, labels, class_names, selected_index=None, masks=None,
+                         poly_color=(0,220,220), poly_width=3):
+    draw = ImageDraw.Draw(img_pil)
+    font = _pick_font(16)
+
+    # Outline mask polygons
+    if masks is not None:
+        is_torch = False
+        try:
+            import torch as _t
+            is_torch = isinstance(masks, _t.Tensor)
+        except Exception:
+            pass
+        if is_torch:
+            M = masks.shape[0]
+            def get_mask(k): return masks[k,0].detach().cpu().numpy() if masks.ndim==4 else masks[k].detach().cpu().numpy()
+        else:
+            M = masks.shape[0]
+            def get_mask(k): return masks[k]
+        for idx in range(M):
+            m = get_mask(idx)
+            mb = (m >= 128).astype(np.uint8)
+            cnts, _ = cv2.findContours(mb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            color = (255,200,30) if (selected_index is not None and idx == selected_index) else poly_color
+            for c in cnts:
+                if len(c) < 3: continue
+                poly = [(int(p[0][0]), int(p[0][1])) for p in c]
+                draw.line(poly + [poly[0]], fill=color, width=int(poly_width))
+
+    # Draw widened boxes + ids
+    W, H = img_pil.size
+    for idx, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+        x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+        w = x2 - x1; h = y2 - y1
+        pad_w_vis = 0.22 * w * 2.0  # widen horizontally (~44% total extra width)
+        pad_h_vis = 0.08 * h        # modest vertical pad
+        vx1 = max(0.0, x1 - pad_w_vis)
+        vy1 = max(0.0, y1 - pad_h_vis)
+        vx2 = min(float(W), x2 + pad_w_vis)
+        vy2 = min(float(H), y2 + pad_h_vis)
+
+        color = (80,180,255) if (selected_index is not None and idx == selected_index) \
+                else tuple(int((hash(int(label)) >> (i*8)) & 255) for i in range(3))
+        width = 5 if (selected_index is not None and idx == selected_index) else 3
+        draw.rectangle([vx1, vy1, vx2, vy2], outline=color, width=width)
+
+        lid = int(label)
+        cls_name = class_names[lid] if 0 <= lid < len(class_names) else f"id_{lid}"
+        text = f"{cls_name} {float(score):.2f}"
+        if font: tw, th = draw.textbbox((0,0), text, font=font)[2:]
+        else:    tw, th = (8*len(text), 14)
+        pad = 2
+        draw.rectangle([vx1, vy1 - th - 2*pad, vx1 + tw + 2*pad, vy1], fill=color)
+        draw.text((vx1 + pad, vy1 - th - pad), text, fill=(255,255,255), font=font)
+        idx_text = f"#{idx}"
+        if font: itw, ith = draw.textbbox((0,0), idx_text, font=font)[2:]
+        else:    itw, ith = (12,12)
+        tag_pad = 2
+        draw.rectangle([vx1, vy1, vx1 + itw + 2*tag_pad, vy1 + ith + 2*tag_pad], fill=(0,0,0))
+        draw.text((vx1 + tag_pad, vy1 + tag_pad), idx_text, fill=(255,255,255), font=font)
+    return img_pil
+
+
+def _encode_pil_jpeg(img_pil, quality: int = JPEG_QUALITY) -> bytes:
     buf = io.BytesIO()
     img_pil.save(buf, format="JPEG", quality=int(quality))
     return buf.getvalue()
 
 
-# ---------------- Model selection & load ----------------
+# ====================== Model management ======================
+
 def _available_models() -> List[str]:
     try:
         files = [f for f in os.listdir(MODELS_ROOT) if f.lower().endswith(".pth")]
-        files.sort()
+        files.sort(key=lambda n: (0 if "cuts_maskrcnn_best" in n.lower() else 1, n.lower()))
         return files
     except Exception:
         return []
 
 
 def _select_weights_file() -> Optional[str]:
-    forced = os.getenv("SELECTED_WEIGHTS", "").strip()
-    if forced:
-        cand = forced if os.path.isabs(forced) else os.path.join(MODELS_ROOT, forced)
-        if os.path.isfile(cand):
-            return cand
     models = _available_models()
-    return os.path.join(MODELS_ROOT, models[0]) if models else None
+    if not models: return None
+    return os.path.join(MODELS_ROOT, models[0])
 
 
-DETECTOR = None           # (model, class_names, device)
-WEIGHTS_PATH = None       # absolute path used
-LAST_DETS = None          # dict cache from last snapshot inference
-LAST_FRAME_PIL = None     # last snapshot PIL image (for cropping)
-SELECTED_DET_ID = None    # currently selected detection index
+DETECTOR = None
+WEIGHTS_PATH = None
+LAST_DETS: Optional[Dict] = None
+LAST_FRAME_PIL: Optional["Image.Image"] = None
+SELECTED_DET_ID: Optional[int] = None
+LAST_MASKS: Optional[List[np.ndarray]] = None
 
 
-# ---------------- Flask routes ----------------
+# ====================== Routes ======================
+
 @app.route("/")
 def index():
     model_name = os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else "(none)"
@@ -570,30 +600,24 @@ def index():
         host=CSIM_HOST,
         port=CSIM_PORT,
         model=model_name,
-        models=_available_models(),  # for dropdown
+        models=_available_models(),
     )
 
 
 @app.route("/select_model", methods=["POST"])
 def select_model():
     fname = request.form.get("weights", "").strip()
-    if not fname:
-        return redirect(url_for("index"))
+    if not fname: return redirect(url_for("index"))
     candidate = os.path.join(MODELS_ROOT, fname)
-    if not os.path.isfile(candidate):
-        return redirect(url_for("index"))
+    if not os.path.isfile(candidate): return redirect(url_for("index"))
+    if not TORCH_OK: return redirect(url_for("index"))
 
-    if not TORCH_OK:
-        return redirect(url_for("index"))
-
-    global DETECTOR, WEIGHTS_PATH, LAST_DETS, SELECTED_DET_ID, LAST_FRAME_PIL
+    global DETECTOR, WEIGHTS_PATH, LAST_DETS, SELECTED_DET_ID, LAST_FRAME_PIL, LAST_MASKS
     try:
         DETECTOR = _load_detector(candidate)
         WEIGHTS_PATH = candidate
-        LAST_DETS = None
-        LAST_FRAME_PIL = None
+        LAST_DETS = None; LAST_FRAME_PIL = None; LAST_MASKS = None
         SELECTED_DET_ID = None
-        print(f"[vision_web] switched to model: {WEIGHTS_PATH}", flush=True)
     except Exception as e:
         print(f"[vision_web][ERR] failed to load {candidate}: {e}", flush=True)
     return redirect(url_for("index"))
@@ -602,30 +626,30 @@ def select_model():
 @app.route("/stream_raw/<which>")
 def stream_raw(which: str):
     alias = TOP_SENSOR_ALIAS if which == "top" else SIDE_SENSOR_ALIAS
-    return Response(mjpeg_generator_raw(alias),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(mjpeg_generator_raw(alias), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/snapshot.jpg")
 def snapshot_image():
-    """One-shot detection overlay image (right panel), using the TOP view."""
     frame = grabber.get_frame()
-    if frame is None:
-        abort(503, "no frame yet")
+    if frame is None: abort(503, "no frame yet")
 
     if not TORCH_OK or DETECTOR is None:
-        # If no model, just return the raw frame to keep page useful
         jpg = _encode_jpeg(frame)
         resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
+    poly_color = _parse_hex_color(request.args.get("poly_color"), default=(0, 220, 220))
+    poly_width = request.args.get("poly_width", default=3, type=int)
+
     model, class_names, device = DETECTOR
     try:
-        img_pil, boxes, scores, labels = _run_inference_on_frame(model, device, frame)
-        # cache detections for the UI
-        global LAST_DETS, LAST_FRAME_PIL
+        img_pil, boxes, scores, labels, masks_np = _run_inference_on_frame(model, device, frame)
+
+        global LAST_DETS, LAST_FRAME_PIL, LAST_MASKS
         cnames = class_names or ["__background__", "cut"]
+
         LAST_DETS = {
             "boxes": boxes.numpy().tolist(),
             "scores": scores.numpy().tolist(),
@@ -635,13 +659,17 @@ def snapshot_image():
             "ts": time.time(),
         }
         LAST_FRAME_PIL = img_pil.copy()
-        vis = _draw_detections_pil(img_pil, boxes, scores, labels,
-                                   cnames, selected_index=SELECTED_DET_ID)
+        LAST_MASKS = [m.copy() for m in masks_np] if (masks_np is not None and len(masks_np) > 0) else None
+
+        vis = _draw_detections_pil(
+            img_pil, boxes, scores, labels, cnames,
+            selected_index=SELECTED_DET_ID, masks=masks_np,
+            poly_color=poly_color, poly_width=int(poly_width)
+        )
         jpg = _encode_pil_jpeg(vis, JPEG_QUALITY)
     except Exception as e:
         dbg = frame.copy()
-        cv2.putText(dbg, f"inference error: {e}", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(dbg, f"inference error: {e}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
         jpg = _encode_jpeg(dbg)
 
     resp = make_response(jpg)
@@ -652,11 +680,6 @@ def snapshot_image():
 
 @app.route("/detections")
 def detections_json():
-    """
-    Returns the last snapshot's detections as JSON:
-    [{id, score, label, label_name, box:[x1,y1,x2,y2], cx, cy, w, h, area}], plus selected_id.
-    """
-    global LAST_DETS
     if LAST_DETS is None:
         return jsonify({"detections": [], "message": "No snapshot run yet."})
     boxes = LAST_DETS.get("boxes", [])
@@ -667,27 +690,20 @@ def detections_json():
     for i, (b, s, l) in enumerate(zip(boxes, scores, labels)):
         x1, y1, x2, y2 = map(float, b)
         w = max(0.0, x2 - x1); h = max(0.0, y2 - y1)
-        cx = x1 + 0.5 * w; cy = y1 + 0.5 * h
+        cx = x1 + 0.5*w; cy = y1 + 0.5*h
         lab_name = cnames[int(l)] if (0 <= int(l) < len(cnames)) else f"id_{int(l)}"
-        dets.append({
-            "id": i, "score": float(s), "label": int(l), "label_name": lab_name,
-            "box": [x1, y1, x2, y2],
-            "cx": cx, "cy": cy, "w": w, "h": h, "area": w * h,
-        })
-    return jsonify({
-        "detections": dets,
-        "selected_id": SELECTED_DET_ID,
-        "model": os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else None,
-        "ts": LAST_DETS.get("ts"),
-        "size": LAST_DETS.get("image_size"),
-    })
+        dets.append({"id": i, "score": float(s), "label": int(l), "label_name": lab_name,
+                     "box": [x1,y1,x2,y2], "cx": cx, "cy": cy, "w": w, "h": h, "area": w*h})
+    return jsonify({"detections": dets, "selected_id": SELECTED_DET_ID,
+                    "model": os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else None,
+                    "ts": LAST_DETS.get("ts"), "size": LAST_DETS.get("image_size")})
 
 
 @app.route("/select_cut", methods=["POST"])
 def select_cut():
-    """Set the active detection by index; used by the UI."""
     global SELECTED_DET_ID
     try:
+        idx = None
         if request.is_json:
             payload = request.get_json(force=True, silent=True) or {}
             idx = payload.get("id", None)
@@ -696,72 +712,146 @@ def select_cut():
         if idx is None:
             return jsonify({"ok": False, "error": "no id provided"}), 400
         idx = int(idx)
-        # Validate against last dets length
         n = len(LAST_DETS["boxes"]) if LAST_DETS else 0
         if idx < 0 or idx >= n:
-            return jsonify({"ok": False, "error": f"id {idx} out of range (0..{max(0,n-1)})"}), 400
+            return jsonify({"ok": False, "error": f"id {idx} out of range (0..{max(0, n-1)})"}), 400
         SELECTED_DET_ID = idx
         return jsonify({"ok": True, "selected_id": SELECTED_DET_ID})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/clear_selection", methods=["POST"])
-def clear_selection():
-    global SELECTED_DET_ID
-    SELECTED_DET_ID = None
-    return jsonify({"ok": True, "selected_id": None})
+def _get_selected_crop_and_mask_np(
+    det_id: Optional[int],
+    pad: float = 0.08,
+    outw: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (crop_bgr, crop_mask) using **asymmetric padding** (wider horizontally).
+       You can override via query: &pad_w=..&pad_h=..
+    """
+    if LAST_DETS is None or LAST_FRAME_PIL is None:
+        raise RuntimeError("No snapshot available. Click Snapshot first.")
+    if det_id is None: det_id = SELECTED_DET_ID
+    if det_id is None: raise RuntimeError("No detection selected.")
+    boxes = LAST_DETS.get("boxes", [])
+    if det_id < 0 or det_id >= len(boxes): raise RuntimeError(f"Selected id {det_id} out of range.")
+    if LAST_MASKS is None or det_id >= len(LAST_MASKS) or LAST_MASKS[det_id] is None:
+        raise RuntimeError("ML mask not available. Load cuts_maskrcnn_best.pth and refresh Snapshot.")
+
+    x1, y1, x2, y2 = [float(v) for v in boxes[det_id]]
+    W, H = LAST_DETS.get("image_size", [LAST_FRAME_PIL.width, LAST_FRAME_PIL.height])
+
+    # Wider horizontally by default
+    pad_w = float(request.args.get("pad_w", default=pad * 2.2))
+    pad_h = float(request.args.get("pad_h", default=pad))
+    pw = pad_w * (x2 - x1); ph = pad_h * (y2 - y1)
+
+    xx1 = max(0, int(np.floor(x1 - pw)))-10; yy1 = max(0, int(np.floor(y1 - ph)))
+    xx2 = 10+min(int(np.ceil(x2 + pw)), int(W)); yy2 = min(int(np.ceil(y2 + ph)), int(H))
+
+    crop_pil = LAST_FRAME_PIL.crop((xx1, yy1, xx2, yy2))
+    crop_rgb = np.array(crop_pil)
+    if crop_rgb.ndim == 2: crop_rgb = np.repeat(crop_rgb[..., None], 3, axis=2)
+    crop_bgr = crop_rgb[:, :, ::-1].copy()
+
+    full = LAST_MASKS[det_id]  # HxW uint8
+    crop_mask = full[yy1:yy2, xx1:xx2].copy()
+
+    if outw and outw > 0:
+        w, h = crop_pil.size
+        outh = max(1, int(round(h * (outw / float(w)))))
+        crop_bgr = cv2.resize(crop_bgr, (outw, outh), interpolation=cv2.INTER_LINEAR)
+        crop_mask = cv2.resize(crop_mask, (outw, outh), interpolation=cv2.INTER_NEAREST)
+
+    return crop_bgr, crop_mask
 
 
 @app.route("/selected_crop.jpg")
 def selected_crop():
-    """
-    Return a JPEG crop of the selected detection (or of ?id=<int>), with optional
-    fractional padding (?pad=0.08) and optional resize width (?size=256).
-    """
-    if LAST_DETS is None or LAST_FRAME_PIL is None:
-        abort(503, "no snapshot available")
-    # read params
     try:
         det_id = request.args.get("id", None, type=int)
         pad = request.args.get("pad", default=0.08, type=float)
         outw = request.args.get("size", default=None, type=int)
-    except Exception:
-        det_id = None; pad = 0.08; outw = None
-
-    if det_id is None:
-        det_id = SELECTED_DET_ID
-    if det_id is None:
-        # no selection -> return a tiny info image
-        info = np.zeros((120, 240, 3), np.uint8)
-        cv2.putText(info, "No selection", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
-        jpg = _encode_jpeg(info)
+        crop_bgr, _ = _get_selected_crop_and_mask_np(det_id, pad=pad, outw=outw)
+        jpg = _encode_jpeg(crop_bgr)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    except Exception as e:
+        err = np.zeros((120, 480, 3), np.uint8)
+        cv2.putText(err, f"crop err: {e}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        jpg = _encode_jpeg(err)
         resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
-    boxes = LAST_DETS.get("boxes", [])
-    if det_id < 0 or det_id >= len(boxes):
-        abort(400, f"id {det_id} out of range")
-    x1, y1, x2, y2 = [float(v) for v in boxes[det_id]]
-    W, H = LAST_DETS.get("image_size", [LAST_FRAME_PIL.width, LAST_FRAME_PIL.height])
-    # add fractional padding
-    pw = pad * (x2 - x1); ph = pad * (y2 - y1)
-    xx1 = max(0, int(np.floor(x1 - pw))); yy1 = max(0, int(np.floor(y1 - ph)))
-    xx2 = min(int(np.ceil(x2 + pw)), int(W)); yy2 = min(int(np.ceil(y2 + ph)), int(H))
-    if xx2 <= xx1 or yy2 <= yy1:
-        abort(500, "invalid crop bounds")
-    crop = LAST_FRAME_PIL.crop((xx1, yy1, xx2, yy2))
-    if outw and outw > 0:
-        w, h = crop.size
-        outw = int(outw)
-        outh = max(1, int(round(h * (outw / float(w)))))
-        crop = crop.resize((outw, outh))
-    buf = io.BytesIO(); crop.save(buf, format="JPEG", quality=JPEG_QUALITY)
-    resp = make_response(buf.getvalue())
-    resp.headers["Content-Type"] = "image/jpeg"
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return resp
+
+@app.route("/mask.jpg")
+def mask_image():
+    try:
+        det_id = request.args.get("id", None, type=int)
+        pad = request.args.get("pad", default=0.08, type=float)
+        outw = request.args.get("size", default=None, type=int)
+        crop_bgr, crop_mask = _get_selected_crop_and_mask_np(det_id, pad=pad, outw=outw)
+        vis = cv2.cvtColor(crop_mask, cv2.COLOR_GRAY2BGR)
+        jpg = _encode_jpeg(vis, JPEG_QUALITY)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    except Exception as e:
+        err = np.zeros((160, 680, 3), np.uint8)
+        cv2.putText(err, f"mask error: {e}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        jpg = _encode_jpeg(err)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+
+@app.route("/pattern.jpg")
+def pattern_image():
+    """Centerline-based (continuous) by default; 'perp' is legacy alternative."""
+    try:
+        det_id = request.args.get("id", None, type=int)
+        pad = request.args.get("pad", default=0.08, type=float)
+        outw = request.args.get("size", default=None, type=int)
+
+        style = request.args.get("pattern", default="continuous").lower()
+        spacing = request.args.get("spacing", default=20, type=int)   # used as alpha if adaptive
+        bite = request.args.get("bite", default=0.9, type=float)
+        s_min = request.args.get("s_min", default=8, type=int)
+        s_max = request.args.get("s_max", default=60, type=int)
+        thread_color = _parse_hex_color(request.args.get("thread_color"), default=(30, 200, 255))
+        thread_thick = request.args.get("thread_thick", default=2, type=int)
+
+        crop_bgr, crop_mask = _get_selected_crop_and_mask_np(det_id, pad=pad, outw=outw)
+
+        if style == "perp":
+            over, _ = stitching.draw_stitching_pattern(
+                crop_bgr, crop_mask, info={}, spacing=max(6, spacing),
+                length_scale=2.0, color=thread_color, thickness=int(thread_thick)
+            )
+        else:
+            over, _ = stitching.draw_running_suture_centerline(
+                crop_bgr, crop_mask,
+                alpha=float(spacing),         # curvature weight (acts as 'base spacing')
+                s_min=int(s_min), s_max=int(s_max),
+                bite_frac=float(bite),
+                max_probe=int(max(crop_mask.shape) * 0.6),
+                color_thread=thread_color,
+                thickness=int(thread_thick),
+            )
+
+        jpg = _encode_jpeg(over, JPEG_QUALITY)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    except Exception as e:
+        err = np.zeros((180, 720, 3), np.uint8)
+        cv2.putText(err, f"pattern error: {e}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        jpg = _encode_jpeg(err)
+        resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
 
 
 @app.route("/health")
@@ -769,26 +859,28 @@ def health():
     ok = grabber.get_frame() is not None
     torch_ok = TORCH_OK
     model_loaded = DETECTOR is not None
-    return {
-        "frame": ok,
-        "torch": torch_ok,
-        "model_loaded": model_loaded,
-        "model_name": os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else None,
-    }, 200 if ok else 503
+    return (
+        {
+            "frame": ok,
+            "torch": torch_ok,
+            "model_loaded": model_loaded,
+            "model_name": os.path.basename(WEIGHTS_PATH) if WEIGHTS_PATH else None,
+        },
+        200 if ok else 503,
+    )
 
 
-# ---------------- Main ----------------
+# ====================== Main ======================
+
 def main():
     print(f"[vision_web] templates dir: {TEMPLATES_DIR}", flush=True)
     print(f"[vision_web] models root  : {MODELS_ROOT}", flush=True)
 
-    # start snapshot (TOP) capture thread
     grabber.start()
     t0 = time.time()
     while grabber.get_frame() is None and (time.time() - t0) < 5.0:
         time.sleep(0.05)
 
-    # load a detector (once) if torch is available
     global DETECTOR, WEIGHTS_PATH
     if TORCH_OK:
         WEIGHTS_PATH = _select_weights_file()

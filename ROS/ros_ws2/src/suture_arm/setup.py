@@ -8,6 +8,7 @@ model_files = [
     'ML_detection/mask_cuts_detector.pth',
     'ML_detection/mask_cuts_detector2.pth',
     'ML_detection/mask_cuts_detector3.pth',
+    'ML_detection/cuts_maskrcnn_best.pth',
 ]
 
 ml_files = [
@@ -16,6 +17,7 @@ ml_files = [
     'ML_detection/mask_cuts_detector.py',
     'ML_detection/mask_cuts_detector2.py',
     'ML_detection/mask_cuts_detector3.py',
+    'ML_detection/cuts_maskrcnn_best.py',
 ]
 
 setup(
@@ -53,7 +55,7 @@ setup(
             'coppelia_run = suture_arm.coppelia_runner:main',   
             'dataset_capture = suture_arm.dataset_capture:main', 
             'dataset_capture2 = suture_arm.dataset_capture2:main', 
-
+            'stitching = suture_arm.stitching:main',
         ],
     },
 )
