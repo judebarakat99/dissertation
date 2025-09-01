@@ -809,19 +809,19 @@ def mask_image():
 
 @app.route("/pattern.jpg")
 def pattern_image():
-    """Centerline-based (continuous) by default; 'perp' is legacy alternative."""
     try:
         det_id = request.args.get("id", None, type=int)
         pad = request.args.get("pad", default=0.08, type=float)
         outw = request.args.get("size", default=None, type=int)
 
         style = request.args.get("pattern", default="continuous").lower()
-        spacing = request.args.get("spacing", default=20, type=int)   # used as alpha if adaptive
-        bite = request.args.get("bite", default=0.9, type=float)
-        s_min = request.args.get("s_min", default=8, type=int)
-        s_max = request.args.get("s_max", default=60, type=int)
+        spacing = request.args.get("spacing", default=20, type=int)
+        bite = request.args.get("bite", default=0.9, type=float)  # kept for compatibility (not used in auto path)
+        s_min = request.args.get("s_min", default=8, type=int)    # unused by auto; safe to keep
+        s_max = request.args.get("s_max", default=60, type=int)   # unused by auto; safe to keep
         thread_color = _parse_hex_color(request.args.get("thread_color"), default=(30, 200, 255))
         thread_thick = request.args.get("thread_thick", default=2, type=int)
+        debug_flag = request.args.get("debug", default=0, type=int) == 1
 
         crop_bgr, crop_mask = _get_selected_crop_and_mask_np(det_id, pad=pad, outw=outw)
 
@@ -831,14 +831,16 @@ def pattern_image():
                 length_scale=2.0, color=thread_color, thickness=int(thread_thick)
             )
         else:
-            over, _ = stitching.draw_running_suture_centerline(
+            # Simple continuous, shape-aware; spacing acts as target step (px)
+            over, _ = stitching.draw_running_suture_auto(
                 crop_bgr, crop_mask,
-                alpha=float(spacing),         # curvature weight (acts as 'base spacing')
-                s_min=int(s_min), s_max=int(s_max),
-                bite_frac=float(bite),
-                max_probe=int(max(crop_mask.shape) * 0.6),
+                spacing_px=float(spacing),
+                outside_px=3.0,            # ≥ 3 px outside the cut
+                rect_min_step=6.0,         # rectangles need ≥ 6 px along the length
+                max_probe=int(max(crop_mask.shape) * 1.2),
                 color_thread=thread_color,
                 thickness=int(thread_thick),
+                debug=debug_flag,
             )
 
         jpg = _encode_jpeg(over, JPEG_QUALITY)
@@ -852,6 +854,7 @@ def pattern_image():
         resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
+
 
 
 @app.route("/health")
