@@ -811,50 +811,116 @@ def mask_image():
 def pattern_image():
     try:
         det_id = request.args.get("id", None, type=int)
-        pad = request.args.get("pad", default=0.08, type=float)
-        outw = request.args.get("size", default=None, type=int)
+        pad   = request.args.get("pad",  default=0.08, type=float)
+        outw  = request.args.get("size", default=None, type=int)
 
-        style = request.args.get("pattern", default="continuous").lower()
+        style   = request.args.get("pattern", default="perp").lower()  # perp | continuous | mold
         spacing = request.args.get("spacing", default=20, type=int)
-        bite = request.args.get("bite", default=0.9, type=float)  # kept for compatibility (not used in auto path)
-        s_min = request.args.get("s_min", default=8, type=int)    # unused by auto; safe to keep
-        s_max = request.args.get("s_max", default=60, type=int)   # unused by auto; safe to keep
+        bite    = request.args.get("bite", default=0.9, type=float)    # kept for compat (unused here)
+
+        # Optional robustness/tuning knobs (safe defaults)
+        curvature_gain = request.args.get("curvature_gain", default=18.0, type=float)
+        outside_scale  = request.args.get("outside_scale",  default=0.12, type=float)
+        spur_min_px    = request.args.get("spur_min_px",    default=4,    type=int)
+        border_push_px = request.args.get("border_push_px", default=0.0,  type=float)
+
+        # thread styling
+        def _parse_hex_color(s, default=(30, 200, 255)):
+            if not s:
+                return default
+            s = s.strip()
+            if s[0] == '#':
+                s = s[1:]
+            if len(s) == 3:
+                s = ''.join([c*2 for c in s])
+            if len(s) != 6:
+                return default
+            r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
+            return (b, g, r)  # BGR for OpenCV
+
         thread_color = _parse_hex_color(request.args.get("thread_color"), default=(30, 200, 255))
         thread_thick = request.args.get("thread_thick", default=2, type=int)
-        debug_flag = request.args.get("debug", default=0, type=int) == 1
+        debug_flag   = request.args.get("debug", default=0, type=int) == 1
 
+        # Get crop & its ML mask (from Mask R-CNN), always use ML mask
         crop_bgr, crop_mask = _get_selected_crop_and_mask_np(det_id, pad=pad, outw=outw)
+
+        # Safety guard for mask shape/dtype (stitching handles thresholding internally anyway)
+        if crop_mask is None or crop_mask.size == 0:
+            crop_mask = np.zeros(crop_bgr.shape[:2], np.uint8)
+        elif crop_mask.ndim == 3:
+            crop_mask = cv2.cvtColor(crop_mask, cv2.COLOR_BGR2GRAY)
 
         if style == "perp":
             over, _ = stitching.draw_stitching_pattern(
-                crop_bgr, crop_mask, info={}, spacing=max(6, spacing),
-                length_scale=2.0, color=thread_color, thickness=int(thread_thick)
+                crop_bgr, crop_mask, info={},
+                spacing=int(spacing),
+                length_scale=2.0,
+                color=thread_color,
+                thickness=int(thread_thick),
+                curvature_gain=float(curvature_gain),
+                outside_scale=float(outside_scale),
+                spur_min_px=int(spur_min_px),
             )
-        else:
-            # Simple continuous, shape-aware; spacing acts as target step (px)
+        elif style == "continuous":
             over, _ = stitching.draw_running_suture_auto(
                 crop_bgr, crop_mask,
                 spacing_px=float(spacing),
-                outside_px=3.0,            # ≥ 3 px outside the cut
-                rect_min_step=6.0,         # rectangles need ≥ 6 px along the length
-                max_probe=int(max(crop_mask.shape) * 1.2),
+                outside_px=3.0,
+                rect_min_step=6.0,
+                max_probe=int(max(crop_mask.shape) * 2.0),
                 color_thread=thread_color,
                 thickness=int(thread_thick),
                 debug=debug_flag,
+                curvature_gain=float(curvature_gain),
+                outside_scale=float(outside_scale),
+                spur_min_px=int(spur_min_px),
+            )
+        elif style == "mold":
+            over, _ = stitching.draw_stitching_mold_border(
+                crop_bgr, crop_mask,
+                spacing_px=float(spacing),
+                grow_px=3,
+                max_probe=int(max(crop_mask.shape) * 2.0),
+                color_thread=thread_color,
+                dot_color=(255, 220, 80),
+                thickness=int(thread_thick),
+                draw_dots=True,
+                debug=debug_flag,
+                curvature_gain=float(curvature_gain),
+                spur_min_px=int(spur_min_px),
+                border_push_px=float(border_push_px),
+            )
+        else:
+            # fallback = mold
+            over, _ = stitching.draw_stitching_mold_border(
+                crop_bgr, crop_mask,
+                spacing_px=float(spacing),
+                grow_px=3,
+                max_probe=int(max(crop_mask.shape) * 2.0),
+                color_thread=thread_color,
+                dot_color=(255, 220, 80),
+                thickness=int(thread_thick),
+                draw_dots=True,
+                debug=debug_flag,
+                curvature_gain=float(curvature_gain),
+                spur_min_px=int(spur_min_px),
+                border_push_px=float(border_push_px),
             )
 
         jpg = _encode_jpeg(over, JPEG_QUALITY)
         resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
+
     except Exception as e:
-        err = np.zeros((180, 720, 3), np.uint8)
-        cv2.putText(err, f"pattern error: {e}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        err = np.zeros((220, 840, 3), np.uint8)
+        cv2.putText(err, f"pattern error: {e}", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
         jpg = _encode_jpeg(err)
         resp = make_response(jpg); resp.headers["Content-Type"] = "image/jpeg"
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
-
 
 
 @app.route("/health")
