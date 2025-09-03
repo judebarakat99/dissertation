@@ -1,7 +1,8 @@
+# stitching.py  — suture pattern generators (perp, continuous, mold, bezier)
+# If you prefer to name this file 'suturing.py', just update the import in vision_web.py.
 import cv2
 import numpy as np
 from typing import Dict, Tuple, List, Optional
-
 
 # ============================================================
 # Mask ingestion & hygiene
@@ -387,21 +388,40 @@ def _nudge_inside_mask(bin_mask: np.ndarray, p: np.ndarray) -> np.ndarray:
 # ============================================================
 
 def _sample_curve_adaptive(P: np.ndarray, base_step: float, alpha: float = 18.0) -> np.ndarray:
-    """Curvature-adaptive arclength sampling; fewer rows in tight bends."""
-    P_dense = _resample_polyline(P, max(240, int(2 * max(np.ptp(P[:,0]), np.ptp(P[:,1]), 40))))
-    if len(P_dense) < 3:
+    """
+    Curvature-adaptive arclength sampling; fewer rows in tight bends.
+    SAFE for empty/1-point polylines.
+    """
+    P = np.asarray(P, dtype=np.float32)
+    # --- NEW: guard empties & single-point inputs so np.ptp never sees size 0 ---
+    if P.ndim != 2 or P.shape[0] == 0:
+        return np.zeros((0, 2), np.float32)
+    if P.shape[0] == 1:
+        return P.copy()
+
+    # --- NEW: compute spans safely (no reductions on empty) ---
+    span_x = float(np.ptp(P[:, 0]))  # P has >=2 rows here
+    span_y = float(np.ptp(P[:, 1]))
+    M = max(240, int(2 * max(span_x, span_y, 40.0)))
+
+    P_dense = _resample_polyline(P, M)
+    if P_dense.shape[0] < 3:
         return P_dense
+
     kappa = np.abs(_signed_curvature(P_dense))
     s, L = _polyline_arclen(P_dense)
-    t = [0.0]; cur = 0.0
+
+    t = [0.0]
     while t[-1] < L:
         i = np.searchsorted(s, t[-1], side="right") - 1
         i = np.clip(i, 0, len(s) - 2)
         step_here = float(base_step * (1.0 + alpha * kappa[i]))
         step_here = float(np.clip(step_here, 3.0, 60.0))
-        cur = t[-1] + step_here
-        if cur >= L: break
-        t.append(cur)
+        nxt = t[-1] + step_here
+        if nxt >= L:
+            break
+        t.append(nxt)
+
     tt = np.array(t, dtype=np.float32)
     idx = np.searchsorted(s, tt, side="right") - 1
     idx = np.clip(idx, 0, len(s) - 2)
@@ -409,6 +429,7 @@ def _sample_curve_adaptive(P: np.ndarray, base_step: float, alpha: float = 18.0)
     alpha_t = (tt - s[idx]) / seg_len
     P0 = P_dense[idx].astype(np.float32); P1 = P_dense[idx + 1].astype(np.float32)
     Q = P0 + (P1 - P0) * alpha_t[:, None]
+
     keep = [0]
     for i in range(1, len(Q)):
         if np.linalg.norm(Q[i] - Q[keep[-1]]) >= 1.0:
@@ -451,7 +472,74 @@ def _ensure_progressive(path: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
 
 
 # ============================================================
-# PUBLIC: Perpendicular (curve-hugging staples) — unchanged behavior
+# Entry distance (mm) → pixels helper
+# ============================================================
+
+def _entry_offset_px(entry_mm: float = 4.0,
+                     px_per_mm: Optional[float] = None,
+                     width_px: float = 0.0,
+                     outside_scale: float = 0.12,
+                     outside_px: float = 3.0,
+                     min_px: float = 3.0) -> float:
+    """
+    Returns a safe offset (pixels) to place needle entry points away from the wound edge.
+    - If px_per_mm is provided (>0), enforces entry_mm*px_per_mm as a MINIMUM.
+    - Also respects previous behavior via outside_scale * chord width and outside_px.
+    """
+    entry_px = 0.0
+    if px_per_mm is not None and px_per_mm > 0:
+        entry_px = float(entry_mm) * float(px_per_mm)
+    return float(max(min_px, float(outside_px), float(outside_scale) * float(width_px), entry_px))
+
+
+# ============================================================
+# Quadratic Bézier smoothing for the centerline
+# ============================================================
+
+def _quad_bezier(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Evaluate a quadratic Bézier B(t) = (1−t)^2 p0 + 2(1−t)t p1 + t^2 p2 for vector t."""
+    t = t.astype(np.float32)
+    omt = 1.0 - t
+    return (omt*omt)[:, None] * p0 + (2.0*omt*t)[:, None] * p1 + (t*t)[:, None] * p2
+
+def _bezier_chain_from_polyline(P: np.ndarray, samples_per_seg: int = 16) -> np.ndarray:
+    """
+    Build a C1-ish smooth chain of quadratic Béziers through a polyline:
+    Each internal vertex becomes a control point; segment endpoints are midpoints.
+    """
+    P = np.asarray(P, dtype=np.float32)
+    n = P.shape[0]
+    if n <= 2:
+        return _resample_polyline(P, max(2, (n-1) * samples_per_seg))
+    out = []
+    for i in range(n - 1):
+        if i == 0 and n >= 3:
+            a = P[0]
+            b = P[1]
+            c = 0.5 * (P[1] + P[2])
+        elif i < n - 2:
+            a = 0.5 * (P[i] + P[i+1])
+            b = P[i+1]
+            c = 0.5 * (P[i+1] + P[i+2])
+        else:  # last span
+            a = 0.5 * (P[i] + P[i+1])
+            b = P[i+1]
+            c = P[i+1]
+        t = np.linspace(0.0, 1.0, max(3, int(samples_per_seg)), dtype=np.float32)
+        curve = _quad_bezier(a, b, c, t)
+        if len(out) > 0:
+            curve = curve[1:]  # de-duplicate joint
+        out.append(curve)
+    S = np.vstack(out) if out else P
+    keep = [0]
+    for i in range(1, len(S)):
+        if np.linalg.norm(S[i] - S[keep[-1]]) >= 0.75:
+            keep.append(i)
+    return S[keep].astype(np.float32)
+
+
+# ============================================================
+# PUBLIC: Perpendicular (curve-hugging staples)
 # ============================================================
 
 def draw_stitching_pattern(
@@ -465,6 +553,8 @@ def draw_stitching_pattern(
     curvature_gain: float = 18.0,
     outside_scale: float = 0.12,
     spur_min_px: int = 4,
+    entry_mm: float = 4.0,
+    px_per_mm: Optional[float] = None,
 ):
     out = bgr.copy()
     raw_bin = _as_binary_mask(mask)
@@ -476,7 +566,6 @@ def draw_stitching_pattern(
         if cnt is None or len(cnt) < 5:
             return _debug_safe_return(out, "no contour")
 
-    contour_xy = cnt.reshape(-1, 2).astype(np.float32)
     shape = _classify_shape(cnt)
     base_step = float(max(6, int(spacing)) if shape == "rect" else max(3, int(spacing)))
 
@@ -510,7 +599,9 @@ def draw_stitching_pattern(
         p_plus, p_minus, width = _intersect_normal_with_mask(bin_mask, p, n, max_dist=max_probe)
         if width <= 2.0:
             continue
-        outside_eff = max(3.0, float(outside_scale) * width)
+        outside_eff = _entry_offset_px(entry_mm=entry_mm, px_per_mm=px_per_mm,
+                                       width_px=width, outside_scale=outside_scale,
+                                       outside_px=3.0, min_px=3.0)
         e1 = p_plus + n * outside_eff
         e2 = p_minus - n * outside_eff
         a = (int(round(e1[0])), int(round(e1[1])))
@@ -520,11 +611,13 @@ def draw_stitching_pattern(
         cv2.circle(out, b, 2, color, -1, cv2.LINE_AA)
         segments.append((a, b))
 
+    if not segments:
+        return _debug_safe_return(out, "no pattern segments")
     return out, segments
 
 
 # ============================================================
-# PUBLIC: Continuous zig-zag (shape-aware) — unchanged behavior
+# PUBLIC: Continuous zig-zag (shape-aware)
 # ============================================================
 
 def draw_running_suture_auto(
@@ -540,6 +633,8 @@ def draw_running_suture_auto(
     curvature_gain: float = 18.0,
     outside_scale: float = 0.12,
     spur_min_px: int = 4,
+    entry_mm: float = 4.0,
+    px_per_mm: Optional[float] = None,
 ) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
     out = bgr.copy()
     raw_bin = _as_binary_mask(mask)
@@ -555,24 +650,30 @@ def draw_running_suture_auto(
     shape = _classify_shape(cnt)
 
     def _draw_over_centerline(P: np.ndarray, step_min: float) -> List[Tuple[int,int]]:
+        if P is None or P.size == 0:
+            return []
         base_step = max(step_min, float(spacing_px))
         C = _sample_curve_adaptive(P, base_step=base_step, alpha=float(curvature_gain))
-        if len(C) < 2:
+        if C.shape[0] < 2:
             return []
         N = _normals_from_polyline(C, k=3)
 
         L_pts: List[Tuple[int,int]] = []
         R_pts: List[Tuple[int,int]] = []
-        local_probe = int(2.0 * np.hypot(*bin_mask.shape))
+        local_probe = int(max(max_probe, 2.0 * np.hypot(*bin_mask.shape)))
         for p, n in zip(C, N):
             if np.linalg.norm(n) < 1e-6:
                 continue
+            p = _nudge_inside_mask(bin_mask, p)
             p_plus, p_minus, width = _intersect_normal_with_mask(bin_mask, p, n, max_dist=local_probe)
-            if width <= 2.0:
+            if width <= 1.0:
                 continue
-            outside_eff = max(float(outside_px), float(outside_scale) * width)
-            eR = p_plus + n * outside_eff
-            eL = p_minus - n * outside_eff
+            offset = _entry_offset_px(entry_mm=entry_mm, px_per_mm=px_per_mm,
+                                      width_px=width, outside_scale=outside_scale,
+                                      outside_px=outside_px, min_px=3.0)
+            offset = float(min(offset, 0.45 * width))  # clamp so we never overshoot
+            eR = p_plus + n * offset
+            eL = p_minus - n * offset
             L_pts.append((int(round(eL[0])), int(round(eL[1]))))
             R_pts.append((int(round(eR[0])), int(round(eR[1]))))
 
@@ -586,11 +687,9 @@ def draw_running_suture_auto(
         path = _ensure_progressive(path)
         for a, b in zip(path[:-1], path[1:]):
             cv2.line(out, a, b, color_thread, thickness, cv2.LINE_AA)
-        for p in path:
-            cv2.circle(out, p, 2, color_thread, -1, cv2.LINE_AA)
+        for pxy in path:
+            cv2.circle(out, pxy, 2, color_thread, -1, cv2.LINE_AA)
         if debug:
-            for a, b in zip(P[:-1], P[1:]):
-                cv2.line(out, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), (60,180,60), 1, cv2.LINE_AA)
             cv2.polylines(out, [contour_xy.astype(np.int32)], True, (120,220,220), 1, cv2.LINE_AA)
         return path
 
@@ -613,13 +712,37 @@ def draw_running_suture_auto(
         P = _centerline_from_mask(bin_mask, spur_min_px=int(spur_px))
         all_path += _draw_over_centerline(P, step_min=3.0)
 
+    # if nothing drew, try denser sampling and light mask dilations
+    if not all_path:
+        P = _centerline_from_mask(bin_mask, spur_min_px=int(spur_px))
+        for factor in (0.75, 0.5):
+            all_path = _draw_over_centerline(P, step_min=max(3.0, float(spacing_px) * factor))
+            if all_path:
+                break
+    if not all_path:
+        k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
+        for msk in (cv2.dilate(bin_mask, k1, 1), cv2.dilate(bin_mask, k2, 1)):
+            P = _centerline_from_mask(msk, spur_min_px=int(spur_px))
+            all_path = _draw_over_centerline(P, step_min=max(3.0, float(spacing_px) * 0.66))
+            if all_path:
+                break
+
+    # LAST RESORT: scanline zig-zag across bbox (guaranteed non-empty for non-empty masks)
+    if not all_path and cv2.countNonZero(bin_mask) > 0:
+        all_path = _scanline_zigzag(bin_mask, step=int(max(6, spacing_px)))
+        for a, b in zip(all_path[:-1], all_path[1:]):
+            cv2.line(out, a, b, color_thread, thickness, cv2.LINE_AA)
+        for pxy in all_path:
+            cv2.circle(out, pxy, 2, color_thread, -1, cv2.LINE_AA)
+
     if not all_path:
         return _debug_safe_return(out, "no stitch path")
     return out, all_path
 
 
 # ============================================================
-# PUBLIC: Mold-border zig-zag (NEVER returns empty now)
+# PUBLIC: Mold-border zig-zag (robust)
 # ============================================================
 
 def _zigzag_from_lr(L_pts: List[Tuple[int,int]], R_pts: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
@@ -637,15 +760,14 @@ def _scanline_zigzag(bin_mask: np.ndarray, step: int = 12) -> List[Tuple[int,int
     if xs.size == 0: return []
     y_min, y_max = int(ys.min()), int(ys.max())
     x_min, x_max = int(xs.min()), int(xs.max())
-    H, W = bin_mask.shape[:2]
     L_pts, R_pts = [], []
     for y in range(y_min, y_max + 1, max(3, int(step))):
         row = bin_mask[y, x_min:x_max+1]
         on = np.where(row > 0)[0]
         if on.size < 2:  # need two sides
             continue
-        lx = x_min + on.min()
-        rx = x_min + on.max()
+        lx = x_min + int(on.min())
+        rx = x_min + int(on.max())
         L_pts.append((lx, y))
         R_pts.append((rx, y))
     return _zigzag_from_lr(L_pts, R_pts)
@@ -664,16 +786,12 @@ def draw_stitching_mold_border(
     curvature_gain: float = 18.0,
     spur_min_px: int = 4,
     border_push_px: float = 0.0,
+    entry_mm: float = 4.0,
+    px_per_mm: Optional[float] = None,
+    outside_scale: float = 0.12,          # NEW: accepted for compatibility (not used)
+    **kwargs,                              # NEW: absorb any future extras safely
 ) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
-    """
-    Mold-border zig-zag with robust mask intersector + auto-retries.
-    Strategy:
-      A) enlarged mask (dilate grow_px), centerline sampling, mask-ray intersections
-      B) if empty → halve spacing and retry (up to 2x)
-      C) if empty → use ORIGINAL mask (no dilation) and retry
-      D) if empty → enlarge more (grow_px*2) and retry
-      E) if empty → last-resort scanline zig-zag across bbox
-    """
+
     out = bgr.copy()
     raw_bin = _as_binary_mask(mask)
     bin_mask = _fallback_if_empty(_clean_mask(raw_bin), raw_bin)
@@ -681,12 +799,10 @@ def draw_stitching_mold_border(
     if cv2.countNonZero(bin_mask) == 0:
         return _debug_safe_return(out, "empty mask")
 
-    # contours & shape (for spacing baseline)
     cnt = _largest_contour(bin_mask)
     shape = _classify_shape(cnt) if cnt is not None else "snake"
     base_step = float(max(6.0, spacing_px) if shape == "rect" else max(3.0, spacing_px))
 
-    # centerline(s)
     min_dim = min(bin_mask.shape[:2])
     spur_px = max(0, min(int(min_dim * 0.01), int(spur_min_px)))
     polylines: List[np.ndarray] = []
@@ -697,7 +813,6 @@ def draw_stitching_mold_border(
         P = _centerline_from_mask(bin_mask, spur_min_px=int(spur_px))
         if len(P) >= 2: polylines = [P]
 
-    # Helper that tries with a given sampling step and a given mold mask
     def attempt(mold_mask: np.ndarray, step_val: float) -> List[Tuple[int,int]]:
         adaptive_probe = int(max(max_probe, 2.0 * np.hypot(*mold_mask.shape)))
         all_path: List[Tuple[int,int]] = []
@@ -716,39 +831,35 @@ def draw_stitching_mold_border(
                 p_plus, p_minus, width = _intersect_normal_with_mask(mold_mask, p_fixed, n, max_dist=adaptive_probe)
                 if width <= 1.0:
                     continue
-                if border_push_px != 0.0:
-                    p_plus  = p_plus  + n * float(border_push_px)
-                    p_minus = p_minus - n * float(border_push_px)
+                base_off = _entry_offset_px(entry_mm=entry_mm, px_per_mm=px_per_mm,
+                                            width_px=0.0, outside_scale=0.0,
+                                            outside_px=0.0, min_px=0.0)
+                offset = base_off + float(border_push_px)
+                p_plus  = p_plus  + n * offset
+                p_minus = p_minus - n * offset
                 L_pts.append((int(round(p_minus[0])), int(round(p_minus[1]))))
                 R_pts.append((int(round(p_plus[0])),  int(round(p_plus[1]))))
             if len(L_pts) >= 2 and len(R_pts) >= 2:
                 all_path.extend(_zigzag_from_lr(L_pts, R_pts))
         return all_path
 
-    # Build enlarged molds
     def enlarge(m: np.ndarray, gp: int) -> np.ndarray:
         ksz = max(1, int(gp) * 2 + 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
         return cv2.dilate(m, kernel, iterations=1)
 
     mold_A = enlarge(bin_mask, grow_px)
-    # Try sequence A/B/C/D
     path = attempt(mold_A, base_step)
+    if not path: path = attempt(mold_A, max(3.0, base_step * 0.66))
+    if not path: path = attempt(mold_A, max(3.0, base_step * 0.5))
+    if not path: path = attempt(bin_mask, base_step)
     if not path:
-        path = attempt(mold_A, max(3.0, base_step * 0.66))  # B1 denser
-    if not path:
-        path = attempt(mold_A, max(3.0, base_step * 0.5))   # B2 even denser
-    if not path:
-        path = attempt(bin_mask, base_step)                  # C original mask
-    if not path:
-        mold_D = enlarge(bin_mask, grow_px * 2)              # D larger mold
+        mold_D = enlarge(bin_mask, grow_px * 2)
         path = attempt(mold_D, max(3.0, base_step * 0.66))
 
-    # E) Last resort: scanline zig-zag over bbox (guaranteed path if mask not empty)
     if not path:
         path = _scanline_zigzag(bin_mask, step=int(max(6, spacing_px)))
 
-    # Draw
     for a, b in zip(path[:-1], path[1:]):
         cv2.line(out, a, b, color_thread, int(thickness), cv2.LINE_AA)
     if draw_dots:
@@ -757,18 +868,177 @@ def draw_stitching_mold_border(
 
     if not path:
         return _debug_safe_return(out, "no border path (after all retries)")
-
     if debug:
-        # show chosen mold outline (A or fallback)
         show_cnt = _largest_contour(mold_A)
         if show_cnt is not None:
             cv2.polylines(out, [show_cnt.reshape(-1,2)], True, (200,200,200), 1, cv2.LINE_AA)
+    return out, path
+
+
+# ============================================================
+# PUBLIC: Continuous (Bézier–smoothed centerline)
+# ============================================================
+
+def draw_stitching_bezier(
+    bgr: np.ndarray,
+    mask: np.ndarray,
+    spacing_px: float = 20.0,
+    outside_px: float = 3.0,
+    rect_min_step: float = 6.0,
+    max_probe: int = 240,
+    color_thread: Tuple[int,int,int] = (30, 200, 255),
+    thickness: int = 2,
+    debug: bool = False,
+    curvature_gain: float = 14.0,
+    outside_scale: float = 0.12,
+    spur_min_px: int = 4,
+    bezier_samples_per: int = 16,
+    entry_mm: float = 4.0,
+    px_per_mm: Optional[float] = None,
+    **kwargs,
+) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
+    """
+    Bézier-smoothed continuous suture with robust retries:
+      1) build centerline(s), smooth with quadratic Bézier chain
+      2) sample adaptively, cast normals, clamp offset to ≤45% width
+      3) retry with denser sampling / mask dilation if needed
+      4) final fallback → classic continuous renderer
+    """
+    out = bgr.copy()
+    raw_bin = _as_binary_mask(mask)
+    bin_mask = _fallback_if_empty(_clean_mask(raw_bin), raw_bin)
+
+    cnt = _largest_contour(bin_mask)
+    if cnt is None or len(cnt) < 5:
+        cnt = _largest_contour(raw_bin)
+        if cnt is None or len(cnt) < 5:
+            return _debug_safe_return(out, "no contour")
+
+    shape = _classify_shape(cnt)
+    min_dim = min(bin_mask.shape[:2])
+    spur_px = max(0, min(int(min_dim * 0.01), int(spur_min_px)))
+
+    # collect one or more centerlines (boomerang arms supported)
+    polylines: List[np.ndarray] = []
+    if shape == "boomerang":
+        arms = _boomerang_arms_centerlines(bin_mask, cnt, spur_min_px=int(spur_px))
+        if arms:
+            polylines = arms
+    if not polylines:
+        P = _centerline_from_mask(bin_mask, spur_min_px=int(spur_px))
+        if P.shape[0] >= 2:
+            polylines = [P]
+
+    if not polylines:
+        # fallback to classic continuous early if no polyline at all
+        return draw_running_suture_auto(
+            bgr, mask, spacing_px, outside_px, rect_min_step, max_probe,
+            color_thread, thickness, debug, curvature_gain, outside_scale, spur_min_px,
+            entry_mm=entry_mm, px_per_mm=px_per_mm
+        )
+
+    def _attempt(m: np.ndarray, base_step: float, bez_samp: int, relax_offset: bool = False) -> List[Tuple[int,int]]:
+        """Try to build a path on mask m with sampling params."""
+        probe = int(max(max_probe, 2.0 * np.hypot(*m.shape)))
+        L_pts: List[Tuple[int,int]] = []
+        R_pts: List[Tuple[int,int]] = []
+
+        for P in polylines:
+            if P.shape[0] < 2:
+                continue
+            # Bézier smooth then adaptive sample
+            S = _bezier_chain_from_polyline(P, samples_per_seg=int(max(6, bez_samp)))
+            C = _sample_curve_adaptive(
+                S,
+                base_step=max(rect_min_step if shape == "rect" else 3.0, float(base_step)),
+                alpha=float(curvature_gain)
+            )
+            if C.shape[0] < 2:
+                continue
+
+            N = _normals_from_polyline(C, k=3)
+            for p, n in zip(C, N):
+                if np.linalg.norm(n) < 1e-6:
+                    continue
+                p = _nudge_inside_mask(m, p)
+                p_plus, p_minus, width = _intersect_normal_with_mask(m, p, n, max_dist=probe)
+                # need a real chord
+                if width <= 1.0:
+                    continue
+
+                # offset in px (mm->px minimum), then clamp to ≤45% of local width
+                offset = _entry_offset_px(
+                    entry_mm=entry_mm,
+                    px_per_mm=px_per_mm,
+                    width_px=(0.0 if relax_offset else width),  # in relax mode ignore width scaling
+                    outside_scale=(0.0 if relax_offset else outside_scale),
+                    outside_px=outside_px,
+                    min_px=3.0
+                )
+                offset = float(min(offset, 0.45 * width))  # <- critical clamp
+
+                eR = p_plus + n * offset
+                eL = p_minus - n * offset
+                L_pts.append((int(round(eL[0])), int(round(eL[1]))))
+                R_pts.append((int(round(eR[0])), int(round(eR[1]))))
+
+        if len(L_pts) < 2 or len(R_pts) < 2:
+            return []
+
+        # weave zig-zag
+        path: List[Tuple[int,int]] = []
+        mlen = min(len(L_pts), len(R_pts))
+        for i in range(mlen):
+            path.append(L_pts[i]); path.append(R_pts[i])
+        path = _avoid_crossing(path)
+        path = _ensure_progressive(path)
+        return path
+
+    # try progressively more forgiving settings
+    base = float(spacing_px)
+    tries: List[Tuple[np.ndarray, float, int, bool]] = []
+
+    # 1) nominal
+    tries.append((bin_mask, base, int(bezier_samples_per), False))
+    # 2) denser along curve
+    tries.append((bin_mask, max(3.0, base * 0.75), int(bezier_samples_per * 1.25), False))
+    tries.append((bin_mask, max(3.0, base * 0.50), int(bezier_samples_per * 1.5), False))
+    # 3) light dilations for thin masks
+    k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
+    tries.append((cv2.dilate(bin_mask, k1, iterations=1), max(3.0, base * 0.66), int(bezier_samples_per * 1.25), False))
+    tries.append((cv2.dilate(bin_mask, k2, iterations=1), max(3.0, base * 0.66), int(bezier_samples_per * 1.5), False))
+    # 4) relax offset (ignore width scaling, just enforce mm min and clamp)
+    tries.append((bin_mask, max(3.0, base * 0.66), int(bezier_samples_per * 1.5), True))
+
+    path: List[Tuple[int,int]] = []
+    for m, step, bsamp, relax in tries:
+        path = _attempt(m, step, bsamp, relax_offset=relax)
+        if path:
+            break
+
+    if not path:
+        # last fallback → classic continuous
+        return draw_running_suture_auto(
+            bgr, mask, spacing_px, outside_px, rect_min_step, max_probe,
+            color_thread, thickness, debug, curvature_gain, outside_scale, spur_min_px,
+            entry_mm=entry_mm, px_per_mm=px_per_mm
+        )
+
+    # draw
+    for a, b in zip(path[:-1], path[1:]):
+        cv2.line(out, a, b, color_thread, int(thickness), cv2.LINE_AA)
+    for pxy in path:
+        cv2.circle(out, pxy, 2, color_thread, -1, cv2.LINE_AA)
+
+    if debug:
+        cv2.polylines(out, [cnt.reshape(-1,2)], True, (120,220,220), 1, cv2.LINE_AA)
 
     return out, path
 
 
 # ============================================================
-# Back-compat aliases
+# Back-compat + UI aliases
 # ============================================================
 
 def draw_running_suture_centerline(*args, **kwargs):
@@ -779,3 +1049,16 @@ def draw_running_suture_contour_spline(*args, **kwargs):
 
 def draw_running_suture_spline(*args, **kwargs):
     return draw_running_suture_auto(*args, **kwargs)
+
+# Aliases expected by vision_web dispatcher (pattern=perp|continuous|mold|bezier)
+def draw_stitching_perp(*args, **kwargs):
+    return draw_stitching_pattern(*args, **kwargs)
+
+def draw_stitching_continuous(*args, **kwargs):
+    return draw_running_suture_auto(*args, **kwargs)
+
+def draw_stitching_mold(*args, **kwargs):
+    return draw_stitching_mold_border(*args, **kwargs)
+
+def draw_stitching_bezier_mode(*args, **kwargs):
+    return draw_stitching_bezier(*args, **kwargs)

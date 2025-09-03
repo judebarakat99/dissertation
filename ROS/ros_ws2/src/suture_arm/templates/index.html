@@ -5,305 +5,490 @@
   <title>CoppeliaSim vision + ML masks + Centerline Suture</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>
-    :root { --pad: 12px; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b0c10; color:#e6edf3; }
-    header { padding: var(--pad) calc(var(--pad) * 2); background:#111926; border-bottom:1px solid #1f2a3a; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-    header h1 { margin:0; font-size: 18px; font-weight:600; }
-    header .meta { font-size: 13px; opacity: 0.9; }
-    header form { display:flex; align-items:center; gap:8px; }
-
-    select, input[type="number"], input[type="text"], button, input[type="color"] {
-      background:#1b2432; color:#e6edf3; border:1px solid #2a364b; border-radius:8px; padding:6px 8px; font-size:14px;
+    :root{
+      --bg:#0b0c10; --card:#0f1623; --text:#e6edf3; --muted:#9fb0c6; --line:#1f2a3a;
+      --pad:12px; --gap:16px; --banner-h:68px;
     }
-    input[type="range"] { width: 180px; }
-    button { cursor:pointer; }
-    label { font-size:12px; color:#a7b6cc; }
-    .muted { opacity: .9; color:#9fb0c6; font-size:12px; }
-    main { display:grid; grid-template-columns: 1.2fr 1fr; gap: 16px; padding:16px; }
-    .left-col { display:flex; flex-direction:column; gap:16px; }
-    .panel { background:#0f1623; border:1px solid #1f2a3a; border-radius:12px; padding:12px; }
-    .panel h2 { margin:0 0 8px 0; font-size:14px; font-weight:600; color:#a7b6cc; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--text); font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
 
-    .img-fit {
-      display:block;
-      width:100%;
-      height:auto;
-      max-height: 340px;
-      object-fit: contain;
-      background:#000;
-      border-radius:8px;
+    /* ===== Banner ===== */
+    header.banner{
+      position:sticky; top:0; z-index:10;
+      display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;
+      height:var(--banner-h); padding: var(--pad) calc(var(--pad) * 2);
+      background:#111926; border-bottom:1px solid var(--line);
     }
+    header h1{ margin:0; font-size:18px; font-weight:600; }
+    header .meta{ font-size:13px; opacity:.9; }
+    header .left{ display:flex; flex-direction:column; gap:4px; }
 
-    .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:8px; }
-    .row > div { display:flex; flex-direction:column; gap:6px; }
-    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
-    .grid-3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; }
-    .controls { display:flex; flex-direction:column; gap:12px; margin-bottom:8px; }
-    .hr { height:1px; background:#1f2a3a; margin:6px 0; }
-    @media (max-width: 1300px) { .grid-3 { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 900px)  {
-      main { grid-template-columns: 1fr; }
-      .grid-3 { grid-template-columns: 1fr; }
+    /* ===== Main grid ===== */
+    .main{ height: calc(100vh - var(--banner-h)); box-sizing: border-box; padding: var(--gap); }
+    .grid{
+      display:grid; gap: var(--gap);
+      grid-template-columns: 1fr 1fr 1fr;
+      grid-template-rows: minmax(260px, 42vh) minmax(0, 1fr);
+      height:100%;
+    }
+    .card{
+      background:var(--card); border:1px solid var(--line); border-radius:12px; display:flex; flex-direction:column; min-height:0;
+    }
+    .card h3{ margin:10px 12px; font-size:14px; font-weight:600; color:#a7b6cc; }
+    .card .body{ padding:12px; display:flex; align-items:center; justify-content:center; gap:12px; flex:1; min-height:0; }
+    .img-wrap{ width:100%; height:100%; background:#000; border-radius:8px; overflow:hidden; }
+    .img-wrap img{ width:100%; height:100%; object-fit:contain; display:block; }
+    .muted{ color:var(--muted); font-size:12px; }
+    .footer{ padding:8px 12px 12px; border-top:1px solid var(--line); display:flex; gap:10px; align-items:center; }
+
+    /* placement */
+    #top-view{ grid-column:1/2; grid-row:1/2; }
+    #side-view{ grid-column:2/3; grid-row:1/2; }
+    #snapshot-view{ grid-column:3/4; grid-row:1/2; }
+    #actions{ grid-column:1/2; grid-row:2/3; min-height:0; overflow:hidden; }
+    #actions .body{ align-items:stretch; justify-content:flex-start; overflow:auto; }
+    #outputs{ grid-column:2/4; grid-row:2/3; display:grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--gap); min-height:0; }
+
+    .panel-compact h4{ margin:10px 12px; font-size:13px; font-weight:600; color:#a7b6cc; }
+    .panel-compact{ background:var(--card); border:1px solid var(--line); border-radius:12px; display:flex; flex-direction:column; min-height:0; }
+    .panel-compact .body{ padding:12px; flex:1; min-height:0; }
+
+    /* Actions layout */
+    .actions-grid{ display:grid; grid-template-columns: 1fr; gap:12px; width:100%; }
+    .row{ display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+    .col{ display:flex; flex-direction:column; gap:6px; }
+
+    select, input[type="number"], input[type="text"], button, input[type="color"]{
+      background:#1b2432; color:var(--text); border:1px solid #2a364b; border-radius:8px; padding:6px 8px; font-size:14px;
+    }
+    button{ cursor:pointer; }
+    label{ font-size:12px; color:#a7b6cc; }
+
+    /* Full-width Controls below grid */
+    #controls-wide{ margin-top: var(--gap); background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
+    .controls-wrap{ display:flex; flex-direction:column; gap:12px; width:100%; }
+    .hr{ height:1px; background:var(--line); margin:6px 0; }
+    input[type="range"]{ width:220px; }
+    input[type="number"]{ width:120px; }
+    input[type="color"]{ width:48px; height:36px; padding:0; }
+
+    @media (max-width:1300px){ #outputs{ grid-template-columns:1fr 1fr; } }
+    @media (max-width:900px){
+      .grid{ grid-template-columns: 1fr; grid-template-rows: 34vh auto auto; }
+      #outputs{ grid-column:1/2; grid-template-columns:1fr; }
     }
   </style>
+
   <script>
+    // --------- state + utils ---------
     let currentDetId = null;
+    const qs = id => document.getElementById(id);
+    const toHex = c => { if(!c) return ""; c=c.trim(); if(c[0]!=='#') c='#'+c; if(c.length===4){ c='#'+c[1]+c[1]+c[2]+c[2]+c[3]+c[3]; } return c; };
+    const cacheBust = url => url + (url.includes('?')?'&':'?') + 'ts=' + Date.now();
 
-    function qs(id){ return document.getElementById(id); }
-    function toHex(c){
-      if(!c) return "";
-      c = c.trim();
-      if(c[0] !== '#') c = '#' + c;
-      if(c.length === 4){ c = '#' + c[1]+c[1] + c[2]+c[2] + c[3]+c[3]; }
-      return c;
-    }
-    function cacheBust(url){ const j = url.includes('?') ? '&' : '?'; return url + j + 'ts=' + Date.now(); }
-
-    async function loadDetections() {
+    // --------- detections (AUTO-SELECT after load) ----------
+    async function loadDetections(){
       const r = await fetch('/detections');
       const data = await r.json();
       const sel = qs('det-select');
       sel.innerHTML = '';
+
       if (!data.detections || data.detections.length === 0) {
         const opt = document.createElement('option');
-        opt.text = '(no detections yet — click Snapshot)'; opt.value = '';
+        opt.text = '(no detections yet — click Refresh All)'; opt.value = '';
         sel.add(opt);
         currentDetId = null;
         return;
       }
+
+      // Populate dropdown
       data.detections.forEach(d => {
         const opt = document.createElement('option');
         const lab = d.label_name || ('id_' + d.label);
-        opt.text = `#${d.id}  (${lab})  ${d.score.toFixed(2)}`;
+        opt.text = `#${d.id} (${lab}) ${d.score.toFixed(2)}`;
         opt.value = d.id;
         sel.add(opt);
       });
-      const wanted = (data.selected_id !== null && data.selected_id !== undefined) ? data.selected_id : data.detections[0].id;
+
+      // Choose and SET the active detection on backend
+      const wanted = (data.selected_id !== null && data.selected_id !== undefined)
+        ? data.selected_id
+        : data.detections[0].id;
+
       sel.value = wanted;
       currentDetId = parseInt(wanted);
+
+      await fetch('/select_cut', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ id: currentDetId })
+      });
     }
 
     async function selectDetection(id){
       if (id === null || id === '' || isNaN(+id)) return;
       currentDetId = parseInt(id);
-      await fetch('/select_cut', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: currentDetId})});
-      refreshAll();
+      await fetch('/select_cut', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ id: currentDetId })
+      });
+      await refreshOutputs();
     }
 
+    // --------- URL builders ----------
     function buildSnapshotURL(){
       const polyColor = toHex(qs('poly-color').value);
       const polyWidth = qs('poly-width').value;
       return cacheBust(`/snapshot.jpg?poly_color=${encodeURIComponent(polyColor)}&poly_width=${encodeURIComponent(polyWidth)}`);
     }
-    function buildCropURL(){
+    function buildCommonArgs(){
       const pad = qs('pad').value;
       const size = qs('crop-size').value;
-      let url = `/selected_crop.jpg?id=${encodeURIComponent(currentDetId)}&pad=${encodeURIComponent(pad)}`;
-      if (size) url += `&size=${encodeURIComponent(size)}`;
-      return cacheBust(url);
+      let q = `pad=${encodeURIComponent(pad)}`;
+      if (size) q += `&size=${encodeURIComponent(size)}`;
+      return q;
+    }
+    function buildCropURL(){
+      return cacheBust(`/selected_crop.jpg?id=${encodeURIComponent(currentDetId)}&${buildCommonArgs()}`);
     }
     function buildMaskURL(){
-      const pad = qs('pad').value;
-      const size = qs('crop-size').value;
-      let url = `/mask.jpg?id=${encodeURIComponent(currentDetId)}&pad=${encodeURIComponent(pad)}`;
-      if (size) url += `&size=${encodeURIComponent(size)}`;
-      return cacheBust(url);
+      return cacheBust(`/mask.jpg?id=${encodeURIComponent(currentDetId)}&${buildCommonArgs()}`);
     }
     function buildPatternURL(){
       const pad = qs('pad').value;
       const size = qs('crop-size').value;
-      const spacing = qs('spacing').value;      // used as alpha
-      const bite = qs('bite').value;
-      const sMin = qs('s-min').value;
-      const sMax = qs('s-max').value;
+      const spacing = qs('gap').value;              // thread spacing px
       const threadColor = toHex(qs('thread-color').value);
       const threadThick = qs('thread-thick').value;
-      const style = qs('pattern-style').value; // continuous|perp
+      const style = qs('pattern-style').value;      // continuous|perp|mold|bezier
+
+      // extended controls
+      const alpha = qs('alpha').value;              // curvature gain
+      const bez = qs('bez-samples').value;
+      const entryMM = qs('entry-mm').value;
+      const pxPerMMraw = qs('px-per-mm').value;
+      const outsideScale = qs('outside-scale').value;
+      const borderPush = qs('border-push').value;
+      const debugFlag = qs('debug-flag').checked ? 1 : 0;
+
+      // old params some handlers still expect
+      const sMin = qs('s-min').value;
+      const sMax = qs('s-max').value;
+
       let url = `/pattern.jpg?id=${encodeURIComponent(currentDetId)}&pad=${encodeURIComponent(pad)}&spacing=${encodeURIComponent(spacing)}`;
-      url += `&bite=${encodeURIComponent(bite)}&pattern=${encodeURIComponent(style)}`;
-      url += `&s_min=${encodeURIComponent(sMin)}&s_max=${encodeURIComponent(sMax)}`;
-      url += `&thread_color=${encodeURIComponent(threadColor)}&thread_thick=${encodeURIComponent(threadThick)}`;
+      url += `&pattern=${encodeURIComponent(style)}&thread_color=${encodeURIComponent(threadColor)}&thread_thick=${encodeURIComponent(threadThick)}`;
+      url += `&curvature_gain=${encodeURIComponent(alpha)}&outside_scale=${encodeURIComponent(outsideScale)}`;
+      url += `&border_push_px=${encodeURIComponent(borderPush)}&debug=${encodeURIComponent(debugFlag)}`;
+      url += `&entry_mm=${encodeURIComponent(entryMM)}&s_min=${encodeURIComponent(sMin)}&s_max=${encodeURIComponent(sMax)}`;
+      if (style === 'bezier') url += `&bez_samples=${encodeURIComponent(bez)}`;
+      if (pxPerMMraw !== '') url += `&px_per_mm=${encodeURIComponent(pxPerMMraw)}`;
       if (size) url += `&size=${encodeURIComponent(size)}`;
       return cacheBust(url);
     }
 
-    function refreshSnapshot(){ qs('snapshot').src = buildSnapshotURL(); }
-    function refreshCrop(){ if(currentDetId!==null) qs('crop').src = buildCropURL(); }
-    function refreshMask(){ if(currentDetId!==null) qs('mask').src = buildMaskURL(); }
-    function refreshPattern(){ if(currentDetId!==null) qs('pattern').src = buildPatternURL(); }
+    // --------- refreshers ----------
+    function refreshTop(){ qs('img-top').src = '/stream_raw/top'; }
+    function refreshSide(){ qs('img-side').src = '/stream_raw/side'; }
 
-    async function refreshAll(){
-      refreshSnapshot();
-      await loadDetections();
-      refreshCrop();
-      refreshMask();
-      refreshPattern();
+    // Wait for snapshot load (server finishes inference & stores LAST_DETS)
+    function refreshSnapshot(){
+      return new Promise((resolve)=>{
+        const img = qs('img-snapshot');
+        img.onload = () => resolve();
+        img.onerror = (e) => { console.error('snapshot load error', e); resolve(); };
+        img.src = buildSnapshotURL();
+      });
     }
 
+    function attachImgErrorLogging(){
+      [['img-crop','/selected_crop.jpg'], ['img-mask','/mask.jpg'], ['img-pattern','/pattern.jpg']].forEach(([id, name])=>{
+        const el = qs(id);
+        if(!el._errAttached){
+          el.onerror = () => console.error(`${name} load failed`, el.src);
+          el._errAttached = true;
+        }
+      });
+    }
+
+    async function ensureDetectionSelected(){
+      if (currentDetId === null) {
+        await refreshSnapshot();
+        await loadDetections();
+      }
+    }
+
+    async function refreshOutputs(){
+      await ensureDetectionSelected();
+      if (currentDetId === null) return;
+      attachImgErrorLogging();
+      qs('img-crop').src    = buildCropURL();
+      qs('img-mask').src    = buildMaskURL();
+      qs('img-pattern').src = buildPatternURL();
+    }
+
+    async function refreshAll(){
+      refreshTop(); refreshSide();
+      await refreshSnapshot();     // server runs inference & fills dets
+      await loadDetections();      // auto-selects on backend
+      await refreshOutputs();      // now crop/mask/pattern have context
+      toggleBezierControls(); updateEntryHint();
+    }
+
+    // --------- Actions helpers ----------
+    function downloadPattern(){
+      const a = document.createElement('a');
+      a.href = buildPatternURL();
+      a.download = `pattern_${Date.now()}.jpg`;
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+    async function moveRobot(){
+      const payload = {
+        det_id: currentDetId,
+        pattern: qs('pattern-style').value,
+        spacing: Number(qs('gap').value || 20),
+        entry_mm: Number(qs('entry-mm').value || 4),
+        px_per_mm: (qs('px-per-mm').value || null),
+        curvature_gain: Number(qs('alpha').value || 18),
+        bez_samples: Number(qs('bez-samples').value || 16),
+        pad: Number(qs('pad').value || 0.08),
+        size: Number(qs('crop-size').value || 640),
+        thread_thick: Number(qs('thread-thick').value || 2),
+        thread_color: qs('thread-color').value,
+        s_min: Number(qs('s-min').value || 8),
+        s_max: Number(qs('s-max').value || 60),
+      };
+      console.log('[Move Robot] payload →', payload);
+      alert('Robot move command prepared (stub). Wire this to your UR3 endpoint next.');
+    }
+
+    // --------- UI helpers ----------
+    function toggleBezierControls(){
+      const block = qs('bezier-controls');
+      if (!block) return;
+      block.style.display = (qs('pattern-style').value === 'bezier') ? 'flex' : 'none';
+    }
+    function updateEntryHint(){
+      const hint = qs('entry-mm-hint');
+      const mm = Number(qs('entry-mm')?.value ?? 4);
+      const ppmStr = qs('px-per-mm')?.value ?? '';
+      if (ppmStr !== '' && !Number.isNaN(Number(ppmStr))) {
+        const px = mm * Number(ppmStr);
+        hint.textContent = `${mm.toFixed(1)} mm ≈ ${px.toFixed(1)} px`;
+      } else {
+        hint.textContent = `Set px/mm for exact placement; otherwise proportional fallback is used.`;
+      }
+    }
+
+    // --------- init ----------
     async function onPageLoad(){
-      qs('crop-size').value = 320; // compact preview
+      // defaults
+      qs('crop-size').value = 320;
+      qs('alpha').value = 18;
+      qs('gap').value = 20;
       qs('s-min').value = 8;
       qs('s-max').value = 60;
-      await refreshAll();
 
+      // listeners
       qs('det-select').addEventListener('change', (e)=> selectDetection(e.target.value));
-      ['pad','crop-size','spacing','bite','thread-color','thread-thick','pattern-style','s-min','s-max'].forEach(id=>{
-        qs(id).addEventListener('input', ()=>{ refreshCrop(); refreshMask(); refreshPattern(); });
+      [
+        'pad','crop-size','alpha','gap','thread-color','thread-thick','pattern-style','s-min','s-max',
+        'bez-samples','entry-mm','px-per-mm','outside-scale','border-push','poly-color','poly-width','debug-flag'
+      ].forEach(id=>{
+        const el = qs(id); if(!el) return;
+        el.addEventListener('input', async ()=>{
+          if (id === 'pattern-style') toggleBezierControls();
+          if (id === 'entry-mm' || id === 'px-per-mm') updateEntryHint();
+          if (id === 'poly-color' || id === 'poly-width') { await refreshSnapshot(); await loadDetections(); }
+          await refreshOutputs();
+        });
       });
-      ['poly-color','poly-width'].forEach(id=>{
-        qs(id).addEventListener('input', refreshSnapshot);
-      });
-      qs('btn-snapshot').addEventListener('click', refreshAll);
+
+      await refreshAll();
     }
     window.addEventListener('load', onPageLoad);
   </script>
 </head>
 <body>
-  <header>
-    <div>
-      <h1>CoppeliaSim vision (Top & Side) + ML mask + Centerline Suture</h1>
-      <div class="meta">
-        Top: {{ top_sensor }} • Side: {{ side_sensor }} • ZMQ: {{ host }}:{{ port }}
-      </div>
-    </div>
 
-    <form method="POST" action="/select_model" title="Switch ML model">
-      <label for="weights">Model:&nbsp;</label>
-      <select name="weights" id="weights">
-        {% for w in models %}
-          <option value="{{w}}" {% if w == model %}selected{% endif %}>{{w}}</option>
-        {% endfor %}
-      </select>
-      <button type="submit">Load</button>
-    </form>
+  <!-- ===== Banner ===== -->
+  <header class="banner">
+    <div class="left">
+      <h1>CoppeliaSim vision (Top & Side) + ML mask + Centerline Suture</h1>
+      <div class="meta">Top: {{ top_sensor }} • Side: {{ side_sensor }} • ZMQ: {{ host }}:{{ port }}</div>
+    </div>
   </header>
 
-  <main>
-    <!-- LEFT: live raw streams -->
-    <div class="left-col">
-      <div class="panel">
-        <h2>Top view</h2>
-        <img class="img-fit" src="/stream_raw/top" alt="Top view stream"/>
-        <div class="muted">Live raw feed from {{ top_sensor }}</div>
-      </div>
+  <!-- ===== Grid: top row (three views), bottom row (Actions + Outputs) ===== -->
+  <div class="main">
+    <div class="grid">
+      <!-- Top-left -->
+      <section id="top-view" class="card">
+        <h3>Top view</h3>
+        <div class="body"><div class="img-wrap"><img id="img-top" src="/stream_raw/top" alt="Top view stream"/></div></div>
+        <div class="footer"><span class="muted">Live raw feed from {{ top_sensor }}</span></div>
+      </section>
 
-      <div class="panel">
-        <h2>Side view</h2>
-        <img class="img-fit" src="/stream_raw/side" alt="Side view stream"/>
-        <div class="muted">Live raw feed from {{ side_sensor }}</div>
-      </div>
-    </div>
+      <!-- Top-center -->
+      <section id="side-view" class="card">
+        <h3>Side view</h3>
+        <div class="body"><div class="img-wrap"><img id="img-side" src="/stream_raw/side" alt="Side view stream"/></div></div>
+        <div class="footer"><span class="muted">Live raw feed from {{ side_sensor }}</span></div>
+      </section>
 
-    <!-- RIGHT: controls + outputs -->
-    <div class="panel">
-      <h2>Controls</h2>
-      <div class="controls">
-        <div class="grid-2">
-          <div>
+      <!-- Top-right -->
+      <section id="snapshot-view" class="card">
+        <h3>Snapshot (mask polygons + widened boxes)</h3>
+        <div class="body"><div class="img-wrap"><img id="img-snapshot" alt="Snapshot with overlays"/></div></div>
+        <div class="footer"><span class="muted">“Refresh All” takes a new snapshot and reloads detections.</span></div>
+      </section>
+
+      <!-- Bottom-left: ACTIONS -->
+      <section id="actions" class="card">
+        <h3>Actions</h3>
+        <div class="body">
+          <div class="actions-grid">
+            <!-- Model load (same server POST) -->
             <div class="row">
-              <div>
-                <label>Detection</label>
-                <select id="det-select"></select>
-              </div>
-              <div>
-                <label>Crop pad (rel)</label>
-                <input type="number" id="pad" step="0.01" value="0.08" min="0" max="0.5">
-              </div>
-              <div>
-                <label>Crop width (px)</label>
-                <input type="number" id="crop-size" step="1" placeholder="(auto)">
-              </div>
-            </div>
-            <div class="hr"></div>
-            <div class="row">
-              <div>
-                <label>Curvature weight α</label>
-                <input type="range" id="spacing" min="10" max="300" step="2" value="180">
-              </div>
-              <div>
-                <label>Bite depth (0..1.8)</label>
-                <input type="range" id="bite" min="0.3" max="1.8" step="0.01" value="0.90">
-              </div>
-              <div>
-                <label>Pattern</label>
-                <select id="pattern-style">
-                  <option value="continuous">continuous (curved)</option>
-                  <option value="perp">perpendicular (hug curve)</option>
-                  <option value="mold" selected>MOLD zig-zag (border)</option>
+              <form method="POST" action="/select_model" title="Switch ML model" class="row" style="gap:8px;">
+                <label for="weights">Model</label>
+                <select name="weights" id="weights">
+                  {% for w in models %}
+                    <option value="{{w}}" {% if w == model %}selected{% endif %}>{{w}}</option>
+                  {% endfor %}
                 </select>
+                <button type="submit">Load</button>
+              </form>
+            </div>
 
-              </div>
-            </div>
+            <!-- Detections dropdown -->
             <div class="row">
-              <div>
-                <label>Min spacing (px)</label>
-                <input type="number" id="s-min" min="4" max="60" step="1" value="8">
-              </div>
-              <div>
-                <label>Max spacing (px)</label>
-                <input type="number" id="s-max" min="20" max="120" step="1" value="60">
-              </div>
+              <label for="det-select">Detections</label>
+              <select id="det-select" style="min-width:260px;"></select>
             </div>
-            <div class="row">
-              <div>
-                <label>Thread color</label>
-                <input type="color" id="thread-color" value="#1ed5ff">
-              </div>
-              <div>
-                <label>Thread thickness</label>
-                <input type="range" id="thread-thick" min="1" max="6" step="1" value="2">
-              </div>
-              <div>
-                <label>Thread spacing (px)</label>
-                <input type="range" id="spacing" min="3" max="80" step="1" value="20">
-              </div>
-            </div>
-          </div>
 
-          <div>
+            <!-- Pattern dropdown -->
             <div class="row">
-              <div>
-                <label>Polygon color (snapshot)</label>
-                <input type="color" id="poly-color" value="#00dcdc">
-              </div>
-              <div>
-                <label>Polygon width</label>
-                <input type="range" id="poly-width" min="1" max="8" step="1" value="3">
-              </div>
+              <label for="pattern-style">Pattern</label>
+              <select id="pattern-style">
+                <option value="continuous">continuous (curved)</option>
+                <option value="perp">perpendicular (hug curve)</option>
+                <option value="mold">MOLD zig-zag (border)</option>
+                <option value="bezier">quadratic Bézier (smooth)</option>
+              </select>
             </div>
-            <div class="muted">Tip: click <em>Snapshot</em> after moving the scene. The crop is auto-widened horizontally to leave room for entry/exit points outside the cut.</div>
+
+            <!-- Buttons -->
             <div class="row">
-              <button type="button" id="btn-snapshot">Snapshot</button>
+              <button type="button" onclick="refreshAll()">Refresh All</button>
+              <button type="button" onclick="downloadPattern()">Download Pattern</button>
+              <button type="button" onclick="moveRobot()">Move Robot</button>
             </div>
           </div>
         </div>
-      </div>
+      </section>
 
-      <!-- Snapshot preview -->
-      <div class="panel">
-        <h2>Snapshot (mask polygons + widened boxes)</h2>
-        <img id="snapshot" class="img-fit" alt="Snapshot with overlays"/>
-        <div class="muted">Model: {{ model }}</div>
-      </div>
-
-      <!-- Three compact previews: crop, mask, pattern -->
-      <div class="grid-3">
-        <div class="panel">
-          <h2>Selected crop</h2>
-          <img id="crop" class="img-fit" alt="Selected crop"/>
+      <!-- Bottom-right: three compact outputs -->
+      <section id="outputs">
+        <div class="panel-compact">
+          <h4>Selected crop</h4>
+          <div class="body"><div class="img-wrap"><img id="img-crop" alt="Selected crop"/></div></div>
         </div>
-
-        <div class="panel">
-          <h2>Selected mask (crop)</h2>
-          <img id="mask" class="img-fit" alt="Selected mask"/>
+        <div class="panel-compact">
+          <h4>Selected mask (crop)</h4>
+          <div class="body"><div class="img-wrap"><img id="img-mask" alt="Selected mask"/></div></div>
         </div>
-
-        <div class="panel">
-          <h2>Suture pattern (over crop)</h2>
-          <img id="pattern" class="img-fit" alt="Pattern over crop"/>
+        <div class="panel-compact">
+          <h4>Suture pattern (over crop)</h4>
+          <div class="body"><div class="img-wrap"><img id="img-pattern" alt="Pattern over crop"/></div></div>
         </div>
-      </div>
+      </section>
     </div>
-  </main>
+
+    <!-- ===== Full-width Controls (everything else) ===== -->
+    <section id="controls-wide">
+      <h3 style="margin:6px 0 10px 4px; font-size:14px; color:#a7b6cc;">Controls</h3>
+      <div class="controls-wrap">
+        <div class="row">
+          <div class="col">
+            <label>Crop pad (rel)</label>
+            <input type="number" id="pad" step="0.01" value="0.08" min="0" max="0.5">
+          </div>
+          <div class="col">
+            <label>Crop width (px)</label>
+            <input type="number" id="crop-size" step="1" placeholder="(auto)">
+          </div>
+          <div class="col">
+            <label>Curvature gain (α)</label>
+            <input type="range" id="alpha" min="4" max="36" step="1" value="18">
+          </div>
+          <div class="col">
+            <label>Thread spacing (px)</label>
+            <input type="range" id="gap" min="6" max="80" step="1" value="20">
+          </div>
+        </div>
+
+        <div id="bezier-controls" class="row" style="display:none;">
+          <div class="col">
+            <label>Bézier samples/segment</label>
+            <input type="range" id="bez-samples" min="6" max="48" step="2" value="16">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col">
+            <label>Entry distance (mm)</label>
+            <input type="range" id="entry-mm" min="1" max="8" step="0.5" value="4">
+            <div id="entry-mm-hint" class="muted"></div>
+          </div>
+          <div class="col">
+            <label>px per mm (optional)</label>
+            <input type="number" id="px-per-mm" step="0.1" placeholder="e.g. 6.5">
+          </div>
+          <div class="col">
+            <label>Min spacing (px)</label>
+            <input type="number" id="s-min" min="4" max="60" step="1" value="8">
+          </div>
+          <div class="col">
+            <label>Max spacing (px)</label>
+            <input type="number" id="s-max" min="20" max="120" step="1" value="60">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col">
+            <label>Thread color</label>
+            <input type="color" id="thread-color" value="#1ed5ff">
+          </div>
+          <div class="col">
+            <label>Thread thickness</label>
+            <input type="range" id="thread-thick" min="1" max="6" step="1" value="2">
+          </div>
+          <div class="col">
+            <label>Outside scale</label>
+            <input type="range" id="outside-scale" min="0" max="0.5" step="0.01" value="0.12">
+          </div>
+          <div class="col">
+            <label>Border push (px)</label>
+            <input type="number" id="border-push" step="0.5" value="0">
+          </div>
+          <div class="col">
+            <label>Polygon color (snapshot)</label>
+            <input type="color" id="poly-color" value="#00dcdc">
+          </div>
+          <div class="col">
+            <label>Polygon width</label>
+            <input type="range" id="poly-width" min="1" max="8" step="1" value="3">
+          </div>
+          <div class="col" style="align-self:flex-end;">
+            <label class="row" style="gap:8px; align-items:center;">
+              <input type="checkbox" id="debug-flag"/><span>Debug overlays</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="hr"></div>
+        <div class="muted">Tip: “Refresh All” takes a new snapshot (updates detections), then refreshes crop, mask, and pattern.</div>
+      </div>
+    </section>
+  </div>
 </body>
 </html>
