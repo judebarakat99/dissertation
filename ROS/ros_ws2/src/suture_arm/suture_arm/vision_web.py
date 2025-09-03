@@ -807,6 +807,7 @@ def mask_image():
         return resp
 
 
+# --- in vision_web.py ---
 @app.route("/pattern.jpg")
 def pattern_image():
     try:
@@ -834,11 +835,14 @@ def pattern_image():
         spur_min_px    = request.args.get("spur_min_px",    default=4,    type=int)
         border_push_px = request.args.get("border_push_px", default=0.0,  type=float)
 
-        # NEW: clinical realism knobs
-        entry_mm  = request.args.get("entry_mm",  default=4.0, type=float)     # 3–5 mm typical
-        px_per_mm = request.args.get("px_per_mm", default=None, type=float)    # optional calibration
+        # Clinical knob: entry distance in mm (we clamp to 5–10 mm as requested)
+        entry_mm  = request.args.get("entry_mm",  default=6.0, type=float)
+        entry_mm  = float(min(10.0, max(5.0, entry_mm)))  # enforce 5–10 mm
 
-        # Bézier-only knob (samples per quadratic segment)
+        # Optional calibration: pixels per mm. If missing, try to auto-guess from mat size.
+        px_per_mm = request.args.get("px_per_mm", default=None, type=float)
+
+        # Bézier-only knob
         bez_samples    = request.args.get("bez_samples",    default=16,   type=int)
 
         # mode-specific extras (sane defaults)
@@ -867,11 +871,24 @@ def pattern_image():
         # ---- fetch crop + mask from current detection ----
         crop_bgr, crop_mask = _get_selected_crop_and_mask_np(det_id, pad=pad, outw=outw)
 
-        # safety for mask dtype/shape (stitching thresholds internally anyway)
+        # safety for mask dtype/shape
         if crop_mask is None or crop_mask.size == 0:
             crop_mask = np.zeros(crop_bgr.shape[:2], np.uint8)
         elif crop_mask.ndim == 3:
             crop_mask = cv2.cvtColor(crop_mask, cv2.COLOR_BGR2GRAY)
+
+        # ---- AUTO mm→px calibration (if user didn't supply px_per_mm) ----
+        # The training mat is 120mm (width) x 175mm (height). If the crop likely
+        # shows the whole mat, derive px/mm from crop size. Otherwise user-supplied
+        # px_per_mm overrides this.
+        if px_per_mm in (None, ""):
+            H, W = crop_bgr.shape[:2]
+            # Always compute both directions and average; user-specified value will override anyway.
+            ppm_w = float(W) / 120.0   # px per mm assuming full width = 120 mm
+            ppm_h = float(H) / 175.0   # px per mm assuming full height = 175 mm
+            # Heuristic: ignore obviously tiny crops (avoid blowing up when zoomed in)
+            # If the crop is small, this stays a rough guess but will still let the slider have an effect.
+            px_per_mm = float(max(0.0, (ppm_w + ppm_h) * 0.5))
 
         # max_probe default: depend on current crop size
         max_probe = max_probe_arg if max_probe_arg is not None else int(max(crop_mask.shape) * 2.0)
@@ -888,13 +905,12 @@ def pattern_image():
             curvature_gain=float(curvature_gain),
             outside_scale=float(outside_scale),
             spur_min_px=int(spur_min_px),
-            # NEW: mm-based entry distance (optional calibration)
+            # pass clamped mm and our (possibly auto-guessed) px/mm
             entry_mm=float(entry_mm),
             px_per_mm=(float(px_per_mm) if px_per_mm not in (None, "") else None),
         )
 
         if style == "perp":
-            # Perpendicular (curve-hugging staples)
             over, _ = stitching.draw_stitching_pattern(
                 crop_bgr, crop_mask, info={},
                 spacing=int(spacing),
@@ -909,7 +925,6 @@ def pattern_image():
             )
 
         elif style == "continuous":
-            # Original continuous running suture
             over, _ = stitching.draw_running_suture_auto(
                 crop_bgr, crop_mask,
                 outside_px=float(outside_px),
@@ -918,7 +933,6 @@ def pattern_image():
             )
 
         elif style == "mold":
-            # Zig-zag molded to border (with auto-retries)
             over, _ = stitching.draw_stitching_mold_border(
                 crop_bgr, crop_mask,
                 grow_px=3,
@@ -927,7 +941,6 @@ def pattern_image():
             )
 
         elif style == "bezier":
-            # NEW: Continuous path using a Quadratic Bézier–smoothed centerline
             draw_fn = getattr(stitching, "draw_stitching_bezier", None)
             if draw_fn is None:
                 over, _ = stitching.draw_running_suture_auto(
@@ -946,7 +959,6 @@ def pattern_image():
                 )
 
         else:
-            # Unknown style → try getattr(stitching, f"draw_stitching_{style}") as a last resort, else mold.
             fn_name = f"draw_stitching_{style}"
             draw_fn = getattr(stitching, fn_name, None)
             if draw_fn is None:
@@ -970,7 +982,6 @@ def pattern_image():
         return resp
 
     except Exception as e:
-        # Show error inline as an image so the UI always renders something
         err = np.zeros((220, 980, 3), np.uint8)
         cv2.putText(err, f"pattern error: {e}", (10, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)

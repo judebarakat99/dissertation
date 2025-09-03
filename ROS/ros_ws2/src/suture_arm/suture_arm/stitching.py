@@ -475,7 +475,8 @@ def _ensure_progressive(path: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
 # Entry distance (mm) → pixels helper
 # ============================================================
 
-def _entry_offset_px(entry_mm: float = 4.0,
+# --- in stitching.py ---
+def _entry_offset_px(entry_mm: float = 6.0,
                      px_per_mm: Optional[float] = None,
                      width_px: float = 0.0,
                      outside_scale: float = 0.12,
@@ -483,12 +484,27 @@ def _entry_offset_px(entry_mm: float = 4.0,
                      min_px: float = 3.0) -> float:
     """
     Returns a safe offset (pixels) to place needle entry points away from the wound edge.
-    - If px_per_mm is provided (>0), enforces entry_mm*px_per_mm as a MINIMUM.
-    - Also respects previous behavior via outside_scale * chord width and outside_px.
+
+    Rules:
+    - Enforce clinical band: 5–10 mm (minimum 5 mm, maximum 10 mm).
+    - If px_per_mm is provided (>0), convert mm→px and use it as a MINIMUM.
+    - Also respect legacy safeguards: outside_scale * chord width and outside_px.
     """
+    # Clamp to requested band
+    entry_mm = float(min(10.0, max(5.0, entry_mm)))
+
     entry_px = 0.0
     if px_per_mm is not None and px_per_mm > 0:
+        # Convert and keep within 5–10 mm in pixel space
         entry_px = float(entry_mm) * float(px_per_mm)
+        min_allowed = 5.0 * float(px_per_mm)
+        max_allowed = 10.0 * float(px_per_mm)
+        if entry_px < min_allowed:
+            entry_px = min_allowed
+        elif entry_px > max_allowed:
+            entry_px = max_allowed
+
+    # Final offset is the maximum of: mm-based minimum, fixed px floor, and proportional-to-width.
     return float(max(min_px, float(outside_px), float(outside_scale) * float(width_px), entry_px))
 
 
