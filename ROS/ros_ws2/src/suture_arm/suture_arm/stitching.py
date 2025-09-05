@@ -1,5 +1,3 @@
-# stitching.py  — suture pattern generators (perp, continuous, mold, bezier)
-# If you prefer to name this file 'suturing.py', just update the import in vision_web.py.
 import cv2
 import numpy as np
 from typing import Dict, Tuple, List, Optional
