@@ -4731,3 +4731,9 @@ ML_codes/simulation_ML2/simulation_coco/valid/frame_000182_jpg.rf.e815d8b49799af
 ML_codes/simulation_ML2/simulation_coco/valid/frame_000191_jpg.rf.e4d6e3c593377e0e4a208a1b725b291b.jpg
 ML_codes/simulation_ML2/cuts_maskrcnn_best.pth
 ROS/ros_ws2/src/suture_arm/ML_detection/cuts_maskrcnn_best.pth
+ROS/attempt3/ros_ws2/src/suture_arm/ML_detection/cuts_detector_best.pth
+ROS/attempt3/ros_ws2/src/suture_arm/ML_detection/cuts_detector_best2.pth
+ROS/attempt3/ros_ws2/src/suture_arm/ML_detection/cuts_maskrcnn_best.pth
+ROS/attempt3/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector.pth
+ROS/attempt3/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector2.pth
+ROS/attempt3/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector3.pth
