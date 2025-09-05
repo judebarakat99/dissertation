@@ -62,6 +62,8 @@ setup(
             'csim_frames = suture_arm.csim_frames:main',
             'model_interface = suture_arm.model_interface:main',
             'image_to_map_mapper = suture_arm.image_to_map_mapper:main',
+            'suture_executor = suture_arm.suture_executor:main',
+            
         ],
     },
 )
