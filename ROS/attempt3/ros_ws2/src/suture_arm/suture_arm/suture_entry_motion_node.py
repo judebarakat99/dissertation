@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import math
-import time
-import json
-import subprocess
+import os, math, time, json, subprocess
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
 import numpy as np
-
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String as MsgString
-
-# Kinematics
-import tf_transformations as tft
 from ikpy.chain import Chain
-from ament_index_python.packages import get_package_share_directory
 
 # CoppeliaSim ZMQ Remote API
 try:
@@ -27,58 +18,54 @@ except ImportError:
     from zmqRemoteApi import RemoteAPIClient  # legacy fallback
 
 
-# ----------------- Defaults / Tunables -----------------
+# ====================== Tunables ======================
+
 CSIM_HOST_DEFAULT = "127.0.0.1"
 CSIM_PORT_DEFAULT = 23000
 
-ROBOT_BASE_PATH_DEFAULT = "/UR3"     # your UR3 root in the scene
-SUTURE_FRAME_PATH_DEFAULT = "/mat"   # your dummy 'mat' (parent of suture_pad[1])
+ROBOT_BASE_PATH_DEFAULT = "/UR3"   # UR3 root in scene
+SUTURE_FRAME_PATH_DEFAULT = "/mat" # mat dummy
 
-JOINT_NAMES_DEFAULT = [
-    "shoulder_pan_joint",
-    "shoulder_lift_joint",
-    "elbow_joint",
-    "wrist_1_joint",
-    "wrist_2_joint",
-    "wrist_3_joint",
+JOINT_NAMES = [
+    "shoulder_pan_joint",  # J1
+    "shoulder_lift_joint", # J2
+    "elbow_joint",         # J3
+    "wrist_1_joint",       # J4
+    "wrist_2_joint",       # J5
+    "wrist_3_joint",       # J6
 ]
 
-# Approach / motion shaping (meters / radians)
-APPROACH_Z_DEFAULT = 0.012          # 12 mm above surface
-DEPTH_DEFAULT      = 0.003          # 3 mm down into mat (pierce)
-LINEAR_STEP_RAD    = 0.01           # max joint change per streamed step
+# Mat physical size (meters) — centered origin in /mat
+MAT_HALF_X = 0.2975 * 0.5   # 0.14875 m
+MAT_HALF_Y = 0.4250  * 0.5  # 0.21250 m
+
+# Approach / motion shaping
+APPROACH_Z_DEFAULT = 0.012      # 12 mm above surface (in /mat z)
+DEPTH_DEFAULT      = 0.003      # 3 mm below surface (pierce)
+LINEAR_STEP_RAD    = 0.01
 SETTLE_TIME_SEC    = 0.004
-POSE_TILT_RAD      = 0.20           # ~11.5°, small pitch to avoid straight wrist
 
-# Preferred seed posture (UR3 elbow-up-ish)
-NOMINAL_Q = np.array([0.0, -1.35, 1.90, 0.0, 1.30, 0.0])
-
-# Soft joint limits (adjust if your scene needs more freedom)
-#          J1 (pan)         J2 (shoulder)   J3 (elbow)      J4 (wrist1)   J5 (wrist2)   J6 (wrist3)
+# Joint soft limits
 SOFT_LIMITS = np.array([
-    [-math.pi,  math.pi],   # [-180°, 180°]
-    [-2.60,     -0.10],
-    [ 0.00,      3.00],
-    [-2.50,      2.50],
-    [ 0.25,      2.80],     # keep away from 0 (straight wrist) and extremes
-    [-math.pi,  math.pi],
+    [-math.pi,  math.pi],  # J1
+    [-2.60,     -0.10],    # J2
+    [ 0.00,      3.00],    # J3
+    [-2.50,      2.50],    # J4
+    [ 0.25,      2.80],    # J5
+    [-2.20,      2.20],    # J6
 ], dtype=float)
 TWOPI = 2.0 * math.pi
-# -------------------------------------------------------
+
+# DLS IK params (J1..J3 only)
+DLS_LAMBDA   = 0.02      # damping
+DLS_GAIN     = 0.8       # step gain
+MAX_DQ_ARM   = 0.10      # max per-iter change for J1..J3 (rad)
+POS_TOL      = 5e-4      # 0.5 mm tolerance
+MAX_ITERS    = 120
+JAC_EPS      = 1e-4      # rad, numeric jacobian epsilon
 
 
-@dataclass
-class PoseRPY:
-    xyz: np.ndarray                 # (3,)
-    rpy: Tuple[float, float, float] # roll, pitch, yaw
-
-
-# ----------------- Small helpers -----------------
-def rpy_to_T(xyz: np.ndarray, rpy: Tuple[float, float, float]) -> np.ndarray:
-    T = np.eye(4)
-    T[:3, :3] = tft.euler_matrix(*rpy)[:3, :3]
-    T[:3,  3] = xyz
-    return T
+# ====================== Small helpers ======================
 
 def wrap_to_nearest(q_target: np.ndarray, q_ref: np.ndarray) -> np.ndarray:
     out = q_target.copy()
@@ -95,8 +82,12 @@ def clamp_soft(q: np.ndarray) -> np.ndarray:
         q[i] = min(max(q[i], lo), hi)
     return q
 
-def blend_seed(q_seed: np.ndarray, alpha: float = 0.7) -> np.ndarray:
-    return alpha * q_seed + (1.0 - alpha) * NOMINAL_Q
+def clamp_xy_to_mat(xy: np.ndarray) -> np.ndarray:
+    """Clamp XY to the centered mat rectangle with 1 mm margin."""
+    return np.array([
+        float(np.clip(xy[0], -MAT_HALF_X + 1e-3, MAT_HALF_X - 1e-3)),
+        float(np.clip(xy[1], -MAT_HALF_Y + 1e-3, MAT_HALF_Y - 1e-3))
+    ], dtype=float)
 
 def sample_polyline(poly: np.ndarray, spacing: float) -> np.ndarray:
     """Resample Nx2 (or Nx3) polyline at ~equal arc distance 'spacing' (meters)."""
@@ -119,85 +110,33 @@ def sample_polyline(poly: np.ndarray, spacing: float) -> np.ndarray:
         out = np.vstack([out, P[-1]])
     return out
 
+def quat_to_R(qx, qy, qz, qw) -> np.ndarray:
+    x, y, z, w = qx, qy, qz, qw
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    return np.array([
+        [1-2*(yy+zz),   2*(xy-wz),     2*(xz+wy)],
+        [  2*(xy+wz), 1-2*(xx+zz),     2*(yz-wx)],
+        [  2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)],
+    ], dtype=float)
 
-# ----------------- IK wrapper for UR -----------------
-class IKUR:
-    def __init__(self, ur_type: str = "ur3"):
-        # Expand URDF from xacro
-        ur_desc = get_package_share_directory("ur_description")
-        xacro_path = os.path.join(ur_desc, "urdf", "ur.urdf.xacro")
-        ur_type = ur_type.lower()
-        valid = {"ur3","ur3e","ur5","ur5e","ur10","ur10e","ur16e","ur20"}
-        if ur_type not in valid:
-            raise ValueError(f"Unsupported UR type '{ur_type}'. Choose one of: {sorted(valid)}")
-        cfg_dir = os.path.join(ur_desc, "config", ur_type)
-
-        cmd = [
-            "xacro", xacro_path,
-            "name:=ur",
-            f"ur_type:={ur_type}",
-            f"kinematics_params:={os.path.join(cfg_dir, 'default_kinematics.yaml')}",
-            f"joint_limit_params:={os.path.join(cfg_dir, 'joint_limits.yaml')}",
-            f"physical_params:={os.path.join(cfg_dir, 'physical_parameters.yaml')}",
-            f"visual_params:={os.path.join(cfg_dir, 'visual_parameters.yaml')}",
-        ]
-        xml = subprocess.check_output(cmd).decode("utf-8")
-        # Patch continuous->revolute & add wide limits (ikpy requirement)
-        xml = xml.replace('type="continuous"', 'type="revolute"')
-        if "<limit" not in xml:
-            xml = xml.replace(
-                "</joint>",
-                '<limit lower="-6.283185307179586" upper="6.283185307179586" velocity="3.0" effort="50.0"/></joint>'
-            )
-        tmp_urdf = "/tmp/_ur.urdf"
-        with open(tmp_urdf, "w") as f:
-            f.write(xml)
-
-        self.chain = Chain.from_urdf_file(tmp_urdf, base_elements=["base_link"], active_links_mask=None)
-
-        target_joint_names = JOINT_NAMES_DEFAULT
-        link_names = [getattr(l, "name", f"link_{i}") for i, l in enumerate(self.chain.links)]
-        name_to_idx = {n: i for i, n in enumerate(link_names)}
-        missing = [n for n in target_joint_names if n not in name_to_idx]
-        if missing:
-            raise RuntimeError(
-                "Could not find these UR joints in URDF: "
-                + ", ".join(missing)
-                + f"\nAvailable: {link_names}"
-            )
-        self.active_idx = [name_to_idx[n] for n in target_joint_names]
-        self.q_full = np.zeros(len(self.chain.links))
-
-    def solve(self, T_target: np.ndarray, q_seed: Optional[np.ndarray]) -> np.ndarray:
-        if q_seed is None:
-            q_seed = NOMINAL_Q
-        # Warm start near nominal pose
-        q0 = self.q_full.copy()
-        bseed = blend_seed(q_seed)
-        for k, idx in enumerate(self.active_idx):
-            q0[idx] = bseed[k]
-
-        # Try 6D orientation first, fallback to Z-only
-        try:
-            sol_all = self.chain.inverse_kinematics_frame(T_target, initial_position=q0, orientation_mode="all")
-            q = np.array([sol_all[idx] for idx in self.active_idx])
-        except Exception:
-            sol_z = self.chain.inverse_kinematics_frame(T_target, initial_position=q0, orientation_mode="z")
-            q = np.array([sol_z[idx] for idx in self.active_idx])
-
-        q = clamp_soft(q)
-        for k, idx in enumerate(self.active_idx):
-            self.q_full[idx] = q[k]
-        return q
+def pose7_to_T(pose7):
+    x, y, z, qx, qy, qz, qw = pose7
+    T = np.eye(4)
+    T[:3, :3] = quat_to_R(qx, qy, qz, qw)
+    T[:3,  3] = [x, y, z]
+    return T
 
 
-# ----------------- CoppeliaSim driver -----------------
+# ====================== CoppeliaSim driver ======================
+
 class CoppeliaDriver:
     def __init__(self, host: str, port: int, robot_base_path: str, joint_names: List[str]):
         self.client = RemoteAPIClient(host, port)
         self.sim = self.client.require("sim")
 
-        # Ensure simulation runs; use stepped to synchronize streaming
+        # Stepped sim for smooth streaming
         try:
             if hasattr(self.sim, "setStepping"):
                 self.sim.setStepping(True)
@@ -277,51 +216,79 @@ class CoppeliaDriver:
         time.sleep(settle)
 
 
-# ----------------- Planner for entry-only motion -----------------
-def plan_entry_triplets(polyline_mat_m: np.ndarray,
-                        spacing_m: float,
-                        approach_z: float,
-                        depth_m: float,
-                        tilt_rad: float = POSE_TILT_RAD) -> List[PoseRPY]:
+# ====================== DLS (J1..J3 only, wrist locked) ======================
+
+class J13DLS:
     """
-    For each sampled point along the polyline (in MAT frame, meters),
-    produce 3 poses: approach (z=+approach), pierce (z=-depth), retract (z=+approach).
-    Orientation: tool Z down, yaw aligned with local tangent, small pitch tilt.
+    Position-only DLS IK using only J1..J3 (shoulder pan/lift, elbow).
+    J4..J6 are held constant -> NO WRIST SPIN.
     """
-    P = sample_polyline(polyline_mat_m, spacing_m)
-    if len(P) == 0:
-        return []
+    def __init__(self, chain: Chain, active_idx: List[int]):
+        self.chain = chain
+        self.active_idx = active_idx      # 6 entries mapping J1..J6 to ikpy link indices
+        self.q_full = np.zeros(len(self.chain.links))
 
-    poses: List[PoseRPY] = []
-    z0 = 0.0  # mat surface at z=0 in MAT frame
+    def _fk_pos(self, q6: np.ndarray) -> np.ndarray:
+        q_full = self.q_full.copy()
+        for k, idx in enumerate(self.active_idx):
+            q_full[idx] = q6[k]
+        T = self.chain.forward_kinematics(q_full)
+        return T[:3, 3].astype(float)
 
-    for i, p in enumerate(P[:, :2]):
-        # tangent in XY
-        if i == 0:
-            t = P[min(1, len(P)-1), :2] - P[0, :2]
-        elif i == len(P)-1:
-            t = P[-1, :2] - P[-2, :2]
-        else:
-            t = P[i+1, :2] - P[i-1, :2]
-        nrm = np.linalg.norm(t)
-        if nrm < 1e-9:
-            yaw = 0.0
-        else:
-            yaw = math.atan2(t[1], t[0])
+    def _num_jac_pos_j13(self, q6: np.ndarray, eps: float) -> np.ndarray:
+        """
+        Numeric Jacobian (3x3) wrt joints 0,1,2 only. Columns are d p / d qj.
+        """
+        J = np.zeros((3, 3), dtype=float)
+        for j in range(3):  # J1..J3 only
+            dq = np.zeros(6); dq[j] = eps
+            p_plus  = self._fk_pos(q6 + dq)
+            p_minus = self._fk_pos(q6 - dq)
+            J[:, j] = (p_plus - p_minus) / (2.0 * eps)
+        return J
 
-        rpy = (math.pi, -float(tilt_rad), float(yaw))
+    def solve(self,
+              p_target_base: np.ndarray,
+              q_seed: np.ndarray,
+              max_iters: int = MAX_ITERS,
+              tol: float = POS_TOL,
+              lam: float = DLS_LAMBDA,
+              gain: float = DLS_GAIN,
+              max_dq: float = MAX_DQ_ARM) -> np.ndarray:
+        """
+        Drive TCP position to target with J1..J3 only. J4..J6 remain exactly as in q_seed.
+        """
+        q = q_seed.copy()
+        # Freeze current wrist
+        q[3:] = q_seed[3:]
+        for _ in range(max_iters):
+            p_cur = self._fk_pos(q)
+            e = p_target_base - p_cur
+            if float(np.linalg.norm(e)) < tol:
+                break
 
-        entry = np.array([P[i, 0], P[i, 1], z0 - float(depth_m)], dtype=float)
-        appr  = np.array([P[i, 0], P[i, 1], z0 + float(approach_z)], dtype=float)
+            J = self._num_jac_pos_j13(q, JAC_EPS)  # 3x3
 
-        poses.append(PoseRPY(appr,  rpy))  # approach
-        poses.append(PoseRPY(entry, rpy))  # pierce
-        poses.append(PoseRPY(appr,  rpy))  # retract
+            JJt = J @ J.T + (lam ** 2) * np.eye(3)
+            rhs = gain * e
+            try:
+                v = np.linalg.solve(JJt, rhs)   # 3x1
+            except np.linalg.LinAlgError:
+                v = np.linalg.lstsq(JJt, rhs, rcond=None)[0]
+            dq13 = J.T @ v                      # 3x1
 
-    return poses
+            dq13 = np.clip(dq13, -max_dq, max_dq)
+
+            q[:3] = q[:3] + dq13
+            q = clamp_soft(q)
+
+        # ensure wrist preserved exactly
+        q[3:] = q_seed[3:]
+        return q
 
 
-# ----------------- Main ROS2 node -----------------
+# ====================== Node ======================
+
 class EntryMotionNode(Node):
     def __init__(self):
         super().__init__("suture_entry_motion")
@@ -331,7 +298,7 @@ class EntryMotionNode(Node):
         self.declare_parameter("csim_port", CSIM_PORT_DEFAULT)
         self.declare_parameter("robot_base_path", ROBOT_BASE_PATH_DEFAULT)
         self.declare_parameter("suture_frame_path", SUTURE_FRAME_PATH_DEFAULT)
-        self.declare_parameter("joint_names", JOINT_NAMES_DEFAULT)
+        self.declare_parameter("joint_names", JOINT_NAMES)
         self.declare_parameter("approach_z", APPROACH_Z_DEFAULT)
         self.declare_parameter("default_depth", DEPTH_DEFAULT)
         self.declare_parameter("ur_type", "ur3")
@@ -340,104 +307,169 @@ class EntryMotionNode(Node):
         csim_port = int(self.get_parameter("csim_port").get_parameter_value().integer_value or CSIM_PORT_DEFAULT)
         robot_base_path = self.get_parameter("robot_base_path").get_parameter_value().string_value
         suture_frame_path = self.get_parameter("suture_frame_path").get_parameter_value().string_value
-        joint_names = list(self.get_parameter("joint_names").get_parameter_value().string_array_value or JOINT_NAMES_DEFAULT)
+        joint_names = list(self.get_parameter("joint_names").get_parameter_value().string_array_value or JOINT_NAMES)
         self.approach_z = float(self.get_parameter("approach_z").get_parameter_value().double_value or APPROACH_Z_DEFAULT)
         self.default_depth = float(self.get_parameter("default_depth").get_parameter_value().double_value or DEPTH_DEFAULT)
         ur_type = self.get_parameter("ur_type").get_parameter_value().string_value or "ur3"
 
-        # ---- Connect to CoppeliaSim & robot ----
+        # ---- CoppeliaSim ----
         self.driver = CoppeliaDriver(csim_host, csim_port, robot_base_path, joint_names)
-        self.ik = IKUR(ur_type)
 
-        # ---- Compute T_base_mat from scene ----
-        self.T_base_mat = np.eye(4)
-        self._mat_handle = self._resolve_handle(self.driver.sim, suture_frame_path)
-        if self._mat_handle is None:
-            raise RuntimeError(f"Cannot find '{suture_frame_path}' in CoppeliaSim scene.")
-        pos = self.driver.sim.getObjectPosition(self._mat_handle, self.driver.base_h)      # [x,y,z]
-        rpy = self.driver.sim.getObjectOrientation(self._mat_handle, self.driver.base_h)   # [r,p,y]
-        R = tft.euler_matrix(*rpy)[:3, :3]
-        self.T_base_mat[:3, :3] = R
-        self.T_base_mat[:3,  3] = np.array(pos, dtype=float)
+        # ---- T_base_mat from quaternion pose ----
+        def _resolve_handle(sim, path: str) -> Optional[int]:
+            for cand in (path, path.rstrip("/"), path.lstrip("/"), path + "#0"):
+                try:
+                    return sim.getObject(cand)
+                except Exception:
+                    pass
+            return None
+        mat_h = _resolve_handle(self.driver.sim, suture_frame_path)
+        if mat_h is None:
+            raise RuntimeError(f"Cannot find '{suture_frame_path}' in scene.")
+        pose7 = self.driver.sim.getObjectPose(mat_h, self.driver.base_h)  # [x,y,z,qx,qy,qz,qw]
+        self.T_base_mat = pose7_to_T(pose7)
+        pos = self.T_base_mat[:3, 3]
+        self.get_logger().info(f"T_base_mat pos={np.round(pos,6).tolist()}, distance_from_base={float(np.linalg.norm(pos)):.3f} m")
 
-        self.get_logger().info(
-            f"T_base_mat set from scene. frame='{suture_frame_path}' "
-            f"pos={np.round(pos,6).tolist()}, rpy={np.round(rpy,6).tolist()}"
-        )
+        # ---- Build IKPy chain (for FK only) ----
+        from ament_index_python.packages import get_package_share_directory
+        ur_desc = get_package_share_directory("ur_description")
+        xacro_path = os.path.join(ur_desc, "urdf", "ur.urdf.xacro")
+        cfg_dir = os.path.join(ur_desc, "config", ur_type)
+        cmd = [
+            "xacro", xacro_path,
+            "name:=ur",
+            f"ur_type:={ur_type}",
+            f"kinematics_params:={os.path.join(cfg_dir, 'default_kinematics.yaml')}",
+            f"joint_limit_params:={os.path.join(cfg_dir, 'joint_limits.yaml')}",
+            f"physical_params:={os.path.join(cfg_dir, 'physical_parameters.yaml')}",
+            f"visual_params:={os.path.join(cfg_dir, 'visual_parameters.yaml')}",
+        ]
+        xml = subprocess.check_output(cmd).decode("utf-8")
+        xml = xml.replace('type="continuous"', 'type="revolute"')
+        if "<limit" not in xml:
+            xml = xml.replace(
+                "</joint>",
+                '<limit lower="-6.283185307179586" upper="6.283185307179586" velocity="3.0" effort="50.0"/></joint>'
+            )
+        tmp_urdf = "/tmp/_ur.urdf"
+        with open(tmp_urdf, "w") as f:
+            f.write(xml)
+
+        self.chain = Chain.from_urdf_file(tmp_urdf, base_elements=["base_link"], active_links_mask=None)
+        link_names = [getattr(l, "name", f"link_{i}") for i, l in enumerate(self.chain.links)]
+        name_to_idx = {n: i for i, n in enumerate(link_names)}
+        missing = [n for n in JOINT_NAMES if n not in name_to_idx]
+        if missing:
+            raise RuntimeError(f"URDF missing joints: {', '.join(missing)}\nAvailable: {link_names}")
+        self.active_idx = [name_to_idx[n] for n in JOINT_NAMES]
+        self.dls = J13DLS(self.chain, self.active_idx)
 
         # ---- ROS I/O ----
         self.sub = self.create_subscription(MsgString, "/suture_cuts", self.on_cuts, 10)
         self.get_logger().info("EntryMotionNode ready. Waiting for /suture_cuts ...")
 
-    # Robust resolver for scene objects
-    @staticmethod
-    def _resolve_handle(sim, path: str) -> Optional[int]:
-        cands = []
-        if path:
-            cands += [path, path.rstrip("/"), path.lstrip("/")]
-            if not path.endswith("#0"):
-                cands.append(path + "#0")
-        for cand in cands:
-            try:
-                return sim.getObject(cand)
-            except Exception:
-                continue
-        return None
-
+    # ----------------- /suture_cuts callback -----------------
     def on_cuts(self, msg: MsgString):
         """
-        Expected JSON (meters):
-        {
-          "frame_id": "mat",
-          "cuts": [ { "polyline": [[x,y], ...] }, ... ],
-          "params": { "spacing": 0.008, "entry_mm": 0.006 (m!), "depth": 0.003 }
-        }
+        Execute stitched entry motions with position-only DLS on J1..J3 ONLY.
+        J4..J6 remain fixed => no wrist spin.
         """
+        # Parse
         try:
             data = json.loads(msg.data)
         except Exception as e:
             self.get_logger().error(f"/suture_cuts JSON parse error: {e}")
             return
 
-        spacing = float(data.get("params", {}).get("spacing", 0.008))
-        entry_m = float(data.get("params", {}).get("entry_mm", 0.006))  # already in meters (from vision_web)
-        depth   = float(data.get("params", {}).get("depth",   self.default_depth))
+        spacing  = float(data.get("params", {}).get("spacing", 0.008))
+        approach = float(data.get("params", {}).get("entry_mm", self.approach_z))  # already meters
+        depth    = float(data.get("params", {}).get("depth",     self.default_depth))
 
         self.get_logger().info(
-            f"/suture_cuts: {len(data.get('cuts', []))} cuts (spacing={spacing:.3f} m, "
-            f"entry={entry_m:.3f} m, depth={depth:.3f} m)"
+            f"/suture_cuts: {len(data.get('cuts', []))} cut(s) "
+            f"(spacing={spacing:.4f} m, approach={approach:.4f} m, depth={depth:.4f} m)"
         )
 
-        # Slightly open tool if present
         self.driver.set_tool(0.02)
-
         q_seed = self.driver.get_joints()
+
+        Rbm = self.T_base_mat[:3, :3]
+        tbm = self.T_base_mat[:3,  3]
 
         for cut in data.get("cuts", []):
             poly = np.array(cut.get("polyline", []), dtype=float)
-            if poly.ndim != 2 or poly.shape[1] not in (2, 3) or len(poly) < 2:
-                self.get_logger().warn("Skipping malformed polyline")
-                continue
+            if poly.ndim != 2 or poly.shape[1] < 2 or len(poly) < 2:
+                self.get_logger().warn("Skipping malformed polyline"); continue
 
-            # Plan simple entry triplets in MAT frame
-            poses = plan_entry_triplets(poly, spacing, self.approach_z, depth, POSE_TILT_RAD)
-            self.get_logger().info(f"Planned {len(poses)} poses.")
+            # Clamp to pad footprint
+            poly[:, 0] = np.clip(poly[:, 0], -MAT_HALF_X + 1e-3, MAT_HALF_X - 1e-3)
+            poly[:, 1] = np.clip(poly[:, 1], -MAT_HALF_Y + 1e-3, MAT_HALF_Y - 1e-3)
 
-            # Execute
-            for k, pose in enumerate(poses):
-                T_mat = rpy_to_T(pose.xyz, pose.rpy)
-                T_base = self.T_base_mat @ T_mat
-                try:
-                    q_target = self.ik.solve(T_base, q_seed)
-                    q_target = wrap_to_nearest(q_target, q_seed)
-                    q_target = clamp_soft(q_target)
-                    self.driver.goto(q_target)
-                    q_seed = q_target.copy()
-                except Exception as e:
-                    self.get_logger().warn(f"IK/exec failed at step {k}: {e}")
+            # Resample
+            P = sample_polyline(np.c_[poly[:, :2], np.zeros(len(poly))], spacing)
+            if P.shape[0] == 0:
+                self.get_logger().warn("Empty path after resampling"); continue
+
+            self.get_logger().info(f"Executing {P.shape[0]} points (each → approach / pierce / retract).")
+
+            prev_xy = None
+            for i in range(P.shape[0]):
+                xy = clamp_xy_to_mat(P[i, :2])
+
+                # Z levels relative to mat
+                z_levels = [
+                    (+abs(approach), "approach"),
+                    (-abs(depth),    "pierce"),
+                    (+abs(approach), "retract"),
+                ]
+
+                for z_off, phase in z_levels:
+                    # 1) Z-only at prev_xy (keep XY fixed)
+                    if prev_xy is None:
+                        prev_xy = xy.copy()
+
+                    p_mat  = np.array([prev_xy[0], prev_xy[1], z_off], float)
+                    p_base = Rbm @ p_mat + tbm
+
+                    try:
+                        qA = self.dls.solve(
+                            p_target_base=p_base,
+                            q_seed=q_seed,
+                            max_iters=MAX_ITERS, tol=POS_TOL,
+                            lam=DLS_LAMBDA, gain=DLS_GAIN,
+                            max_dq=MAX_DQ_ARM
+                        )
+                        qA = wrap_to_nearest(qA, q_seed); qA = clamp_soft(qA)
+                        self.driver.goto(qA)
+                        q_seed = qA.copy()
+                    except Exception as e:
+                        self.get_logger().warn(f"{phase} Z-only failed at point {i}: {e}")
+
+                    # 2) XY-at-constant-Z to target xy
+                    p_mat  = np.array([xy[0], xy[1], z_off], float)
+                    p_base = Rbm @ p_mat + tbm
+
+                    try:
+                        qB = self.dls.solve(
+                            p_target_base=p_base,
+                            q_seed=q_seed,
+                            max_iters=MAX_ITERS, tol=POS_TOL,
+                            lam=DLS_LAMBDA, gain=DLS_GAIN,
+                            max_dq=MAX_DQ_ARM
+                        )
+                        qB = wrap_to_nearest(qB, q_seed); qB = clamp_soft(qB)
+                        self.driver.goto(qB)
+                        q_seed = qB.copy()
+                        prev_xy = xy.copy()
+                    except Exception as e:
+                        self.get_logger().warn(f"{phase} XY-at-Z failed at point {i}: {e}")
 
         self.driver.set_tool(0.02)
         self.get_logger().info("Finished executing entry motions.")
+
+
+# ====================== main ======================
 
 def main():
     rclpy.init()
@@ -451,7 +483,6 @@ def main():
         if node is not None:
             node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

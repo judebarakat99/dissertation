@@ -85,9 +85,8 @@ PAD_MAPPER = None  # loaded on startup
 
 cuts_node = None
 cuts_pub  = None
-targets_pub = None
 def init_ros2_publisher():
-    global cuts_node, cuts_pub, targets_pub
+    global cuts_node, cuts_pub
     try:
         import rclpy
         from rclpy.node import Node as _RclNode
@@ -103,14 +102,11 @@ def init_ros2_publisher():
         class _CutsNode(_RclNode):
             def __init__(self):
                 super().__init__('suture_cuts_web_publisher')
-                # Publish both the original suture cuts and vision targets.
-                self.pub_cuts = self.create_publisher(_MsgString, '/suture_cuts', 10)
-                self.pub_targets = self.create_publisher(_MsgString, '/vision_targets', 10)
+                self.pub = self.create_publisher(_MsgString, '/suture_cuts', 10)
 
         cuts_node = _CutsNode()
-        cuts_pub  = cuts_node.pub_cuts
-        targets_pub = cuts_node.pub_targets
-        print("[vision_web] ROS2 publishers ready on /suture_cuts and /vision_targets", flush=True)
+        cuts_pub  = cuts_node.pub
+        print("[vision_web] ROS2 publisher ready on /suture_cuts", flush=True)
 
         def _spin_trickle():
             while rclpy.ok():
@@ -724,94 +720,6 @@ def move_robot():
     msg.data = json.dumps(cuts_msg)
     cuts_pub.publish(msg)
     print(f"[vision_web] published /suture_cuts with {len(poly_m)} points (px/mm={px_per_mm:.3f})", flush=True)
-
-    # --------- map CROP path to world (scene) coordinates and publish /vision_targets ---------
-    try:
-        # Ensure the vision targets publisher exists.
-        global targets_pub
-        if targets_pub is None:
-            init_ros2_publisher()
-        # Compute world-frame targets only if publisher is available and we have a path.
-        if targets_pub is not None and path2d:
-            world_targets_list = []
-            # Workspace limits and fixed Z for the target.  You can adjust these
-            # via environment variables or directly below.  X_MIN/X_MAX and
-            # Y_MIN/Y_MAX define the allowed region in the scene frame.  Z_TARGET
-            # defines the tool height in the scene frame.  SAFE_RADIUS limits the
-            # distance from the origin (0,0) to avoid unreachable poses.  By
-            # default, SAFE_RADIUS=0.45 m, Z_TARGET=0.15 m.  You can override
-            # these by setting environment variables of the same name (e.g.
-            # SAFE_RADIUS=0.43, TARGET_Z=0.02).  The orientation of the map
-            # relative to the vision sensor can be flipped or swapped via
-            # environment variables VISION_FLIP_X, VISION_FLIP_Y, VISION_SWAP_XY.
-            X_MIN = float(os.getenv("X_MIN", "-0.626"))
-            X_MAX = float(os.getenv("X_MAX", "-0.333"))
-            Y_MIN = float(os.getenv("Y_MIN", "-0.223"))
-            Y_MAX = float(os.getenv("Y_MAX", "0.223"))
-            Z_TARGET = float(os.getenv("TARGET_Z", "0.15"))
-            # parse flip and swap flags: any non-zero/True value triggers the option
-            flip_x  = str(os.getenv("VISION_FLIP_X", "0")).lower() not in ("0", "false", "no", "off")
-            flip_y  = str(os.getenv("VISION_FLIP_Y", "0")).lower() not in ("0", "false", "no", "off")
-            swap_xy = str(os.getenv("VISION_SWAP_XY", "0")).lower() not in ("0", "false", "no", "off")
-            # Pre-compute crop world centre and translation offset to align
-            # the crop’s centre with the centre of the world workspace.  This
-            # translation corrects systematic offsets when the detected pad
-            # region does not align with the camera’s world origin.
-            x_world_crop_center = -(xx1 + 0.5 * float(Wc)) / float(W_full) if W_full > 0 else 0.0
-            y_world_crop_center = ((yy1 + 0.5 * float(Hc)) / float(H_full) - 0.5) if H_full > 0 else 0.0
-            # Compute the centre of the allowed workspace box.
-            x_world_box_center = 0.5 * (X_MIN + X_MAX)
-            y_world_box_center = 0.5 * (Y_MIN + Y_MAX)
-            dx_center = x_world_box_center - x_world_crop_center
-            dy_center = y_world_box_center - y_world_crop_center
-            for (u_crop, v_crop) in path2d:
-                # Convert crop pixel coordinates to relative coordinates within the crop.
-                # u_rel and v_rel range from 0.0 at the left/top of the crop to 1.0 at
-                # the right/bottom.  This allows us to map directly into the
-                # world-space bounding box of the suture pad regardless of the
-                # crop’s absolute position within the full image.
-                u_rel = float(u_crop) / float(Wc) if Wc > 0 else 0.0
-                v_rel = float(v_crop) / float(Hc) if Hc > 0 else 0.0
-                # Map relative coordinates to world (scene) coordinates.  For the
-                # X axis, u_rel=0 (left) maps to X_MAX and u_rel=1 maps to X_MIN.
-                xw = X_MAX + (X_MIN - X_MAX) * u_rel
-                # For the Y axis, v_rel=0 (top) maps to Y_MIN (upper side), and
-                # v_rel=1 (bottom) maps to Y_MAX (lower side).
-                yw = Y_MIN + (Y_MAX - Y_MIN) * v_rel
-                # Apply optional axis swap and flips.  These allow easy calibration
-                # without code changes when the camera orientation does not match
-                # the robot's world frame.
-                if swap_xy:
-                    xw, yw = yw, xw
-                if flip_x:
-                    xw = -xw
-                if flip_y:
-                    yw = -yw
-                # Apply the centre translation so that the crop’s centre aligns
-                # with the world workspace centre.
-                xw += dx_center
-                yw += dy_center
-                # Limit radial distance to keep within UR3 reach (safe radius).
-                SAFE_RADIUS = float(os.getenv("SAFE_RADIUS", "0.45"))
-                r = (xw * xw + yw * yw) ** 0.5
-                if r > SAFE_RADIUS and r > 0.0:
-                    scale = SAFE_RADIUS / r
-                    xw *= scale
-                    yw *= scale
-                # Clamp into allowed workspace box.
-                if xw < X_MIN: xw = X_MIN
-                if xw > X_MAX: xw = X_MAX
-                if yw < Y_MIN: yw = Y_MIN
-                if yw > Y_MAX: yw = Y_MAX
-                world_targets_list.append({"pos": [float(xw), float(yw), Z_TARGET]})
-            if world_targets_list:
-                vt_payload = {"frame": "scene", "targets": world_targets_list}
-                vt_msg = _MsgString()
-                vt_msg.data = json.dumps(vt_payload)
-                targets_pub.publish(vt_msg)
-                print(f"[vision_web] published /vision_targets with {len(world_targets_list)} points", flush=True)
-    except Exception as e:
-        print(f"[vision_web][WARN] failed to publish /vision_targets: {e}", flush=True)
 
     return jsonify({
         "ok": True,

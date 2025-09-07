@@ -63,7 +63,9 @@ setup(
             'model_interface = suture_arm.model_interface:main',
             'image_to_map_mapper = suture_arm.image_to_map_mapper:main',
             'suture_executor = suture_arm.suture_executor:main',
-            
+            'UR3_targets_ik_node = suture_arm.UR3_targets_ik_node:main',
+            'laparoscopic_ik_node = suture_arm.laparoscopic_ik_node:main',
+            'cuts_to_targets_bridge = suture_arm.cuts_to_targets_bridge:main',
         ],
     },
 )

@@ -2,38 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Suture path executor (Option A: separate node)
+Suture path executor with simIK (no args needed)
 
-- Subscribes:  /suture_cuts (std_msgs/String, JSON from vision_web.py)
-- Publishes:   /suture_waypoints (geometry_msgs/PoseArray) for viz/controller
-- Optional:    /suture_stop (std_msgs/Bool) to stop mid-execution
+Usage:
+  ros2 run suture_arm suture_executor
 
-CoppeliaSim objects (defaults set for your scene):
-  TIP_NAME       = "UR3_tip"                 # IK tip dummy
-  TARGET_NAME    = "dummy needle target"     # IK target dummy (this script moves it)
-  MAT_FRAME_NAME = "mat"                     # parent of suture_pad[1]
-  BASE_FRAME_NAME= ""                        # if empty, auto-detect by walking parents of TIP
-
-Motion tunables (env):
-  APPROACH_M=0.010          # hover height above pad (meters)
-  DEPTH_M=0.003             # peck depth into pad (meters)
-  DWELL_S=0.15              # dwell time at bottom (seconds)
-  TRAVEL_STEP=0.005         # interpolation step (meters)
-  DT=0.03                   # sleep per sub-step (seconds)
-  ORIENT_TOWARDS_TANGENT=1  # 1: align X with path tangent; 0: fixed orientation
-  DRY_RUN=0                 # 1: don't move in sim; just publish PoseArray
-  CSIM_HOST=127.0.0.1
-  CSIM_PORT=23000
+We set the target pose and call simIK.handleGroup() so the **robot joints**
+move (not the target dummy). Auto-finds UR3_tip, dummy needle target, and mat.
 """
 
-import os, json, math, time
-from typing import List, Tuple
-import numpy as np
+import json
+import math
+import time
+from typing import List, Tuple, Optional
 
+import numpy as np
 import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String as MsgString, Bool as MsgBool
 from geometry_msgs.msg import Pose, PoseArray
+from rclpy.node import Node
+from std_msgs.msg import Bool as MsgBool, String as MsgString
 
 try:
     from coppeliasim_zmqremoteapi_client import RemoteAPIClient
@@ -41,8 +28,7 @@ except ImportError:
     from zmqRemoteApi import RemoteAPIClient  # legacy fallback
 
 
-# ------------------------- math helpers -------------------------
-
+# ---------------- math helpers ----------------
 def _R_from_quat(x, y, z, w) -> np.ndarray:
     x, y, z, w = map(float, (x, y, z, w))
     xx, yy, zz = x*x, y*y, z*z
@@ -112,7 +98,7 @@ def _slerp(q0, q1, u):
     q = (math.sin((1-u)*th0)/s0)*q0 + (math.sin(u*th0)/s0)*q1
     return (q / np.linalg.norm(q)).tolist()
 
-def _interp_pose(p0, q0, p1, q1, step_m=0.005):
+def _interp_pose(p0, q0, p1, q1, step_m=0.02):  # faster default
     p0 = np.array(p0, float); p1 = np.array(p1, float)
     q0 = np.array(q0, float); q1 = np.array(q1, float)
     dist = float(np.linalg.norm(p1 - p0))
@@ -129,79 +115,65 @@ def _pose_to_list(pos, quat):
     return [x,y,z,qx,qy,qz,qw]
 
 
-# ------------------------- executor node -------------------------
-
+# ---------------- executor node ----------------
 class SutureExecutor(Node):
     def __init__(self):
         super().__init__("suture_executor")
 
-        # Scene names (yours)
-        self.tip_name     = os.getenv("TIP_NAME", "UR3_tip")
-        self.target_name  = os.getenv("TARGET_NAME", "dummy needle target")
-        self.mat_name     = os.getenv("MAT_FRAME_NAME", "mat")
-        self.base_name    = os.getenv("BASE_FRAME_NAME", "")  # empty => auto-detect
-
-        # Motion params
-        self.approach_m   = float(os.getenv("APPROACH_M", "0.010"))
-        self.depth_m      = float(os.getenv("DEPTH_M",    "0.003"))
-        self.dwell_s      = float(os.getenv("DWELL_S",    "0.15"))
-        self.travel_step  = float(os.getenv("TRAVEL_STEP","0.005"))
-        self.dt           = float(os.getenv("DT",         "0.03"))
-        self.align_tangent= bool(int(os.getenv("ORIENT_TOWARDS_TANGENT", "1")))
-        self.dry_run      = bool(int(os.getenv("DRY_RUN","0")))
+        # Motion params (fast but smooth)
+        self.approach_m   = 0.010
+        self.depth_m      = 0.003
+        self.dwell_s      = 0.05   # shorter dwell
+        self.travel_step  = 0.02   # 2 cm per sub-step
+        self.dt           = 0.0    # no extra sleep
+        self.align_tangent= True
+        self.dry_run      = False
 
         # ROS I/O
         self.sub_cuts = self.create_subscription(MsgString, "/suture_cuts", self.on_cuts, 10)
         self.sub_stop = self.create_subscription(MsgBool,   "/suture_stop", self.on_stop, 10)
         self.pub_waypoints = self.create_publisher(PoseArray, "/suture_waypoints", 10)
 
-        # Sim handles
+        # Sim & IK
         self.sim_client = None
+        for_ik = None
         self.sim = None
+        self.simIK = None
+        self.ik_env = None
+        self.ik_group = None
+
         self.h_base = None
         self.h_mat  = None
         self.h_tip  = None
         self.h_target = None
 
-        self._stop_flag = False
-        self.get_logger().info("SutureExecutor ready (Option A)")
+        # What frame the IK element uses as "base" (-1 means world)
+        self.ik_base_ref = -1
 
-    # ---- sim helpers ----
+        self._stop_flag = False
+        self.get_logger().info("SutureExecutor with simIK ready (no env args)")
+
+    # -------- sim helpers --------
     def ensure_sim(self):
         if self.sim is not None:
             return
-        host = os.getenv("CSIM_HOST", "127.0.0.1")
-        port = int(os.getenv("CSIM_PORT", "23000"))
+        host = "127.0.0.1"
+        port = 23000
         self.sim_client = RemoteAPIClient(host, port)
         self.sim = self.sim_client.require("sim")
 
-        def _get(nm):
-            try: return self.sim.getObject(nm)
-            except Exception:
-                try: return self.sim.getObject(nm.lstrip("/"))
-                except Exception: return None
+        # simIK plugin
+        try:
+            self.simIK = self.sim_client.require("simIK")
+        except Exception as e:
+            raise RuntimeError(f"simIK plugin not available: {e}")
 
-        self.h_tip    = _get(self.tip_name)
-        self.h_target = _get(self.target_name)
-        self.h_mat    = _get(self.mat_name)
-        if self.h_tip is None or self.h_target is None or self.h_mat is None:
-            raise RuntimeError(f"Missing handles: tip={self.h_tip}, target={self.h_target}, mat={self.h_mat}")
-
-        if self.base_name:
-            self.h_base = _get(self.base_name)
-            if self.h_base is None:
-                raise RuntimeError(f"BASE_FRAME_NAME '{self.base_name}' not found")
-        else:
-            # auto-detect base by walking parents from tip to root
-            h = self.h_tip
-            parent = self.sim.getObjectParent(h)
-            while parent != -1:
-                h = parent
-                parent = self.sim.getObjectParent(h)
-            self.h_base = h
-            self.get_logger().info(f"Auto-detected base handle: {self.h_base}")
-
-        # ensure sim is running
+        # make sure sim is running; free-run for speed
+        try:
+            if hasattr(self.sim, "setStepping"):
+                self.sim.setStepping(False)
+        except Exception:
+            pass
         try:
             st = self.sim.getSimulationState()
             if st in (self.sim.simulation_stopped, self.sim.simulation_paused):
@@ -209,13 +181,180 @@ class SutureExecutor(Node):
         except Exception:
             pass
 
+        # 1) TIP
+        self.h_tip = self._resolve_exact_or_variants("UR3_tip")
+        if self.h_tip is None:
+            raise RuntimeError("Could not find 'UR3_tip'.")
+
+        # 2) MAT
+        self.h_mat = self._resolve_exact_or_variants("mat")
+        if self.h_mat is None:
+            self.h_mat = self._search_near(self.h_tip, [], ["mat", "pad", "suture_pad"])
+        if self.h_mat is None:
+            raise RuntimeError("Could not find 'mat' dummy.")
+
+        # 3) TARGET
+        self.h_target = self._resolve_exact_or_variants("dummy needle target")
+        if self.h_target is None:
+            self.h_target = self._search_descendant_dummy(self.h_tip, ["needle","target"], [])
+            if self.h_target is None:
+                self.h_target = self._search_descendant_dummy(self.h_tip, [], ["needle","target","biopsy","forcep"])
+        if self.h_target is None:
+            self._dump_descendants(self.h_tip, "tip subtree (looking for '*needle*' AND/OR '*target*')")
+            raise RuntimeError("Could not find the target dummy under the tool.")
+
+        # 4) BASE (walk to root for fallback signature)
+        h = self.h_tip
+        parent = self.sim.getObjectParent(h)
+        while parent != -1:
+            h = parent
+            parent = self.sim.getObjectParent(h)
+        self.h_base = h  # model root, used only if world-base fails
+
+        # 5) Build IK task: TIP follows TARGET (full pose constraint)
+        self.ik_env = self.simIK.createEnvironment()
+        self.ik_group = self.simIK.createGroup(self.ik_env)
+        self.simIK.setGroupCalculation(self.ik_env, self.ik_group,
+                                       self.simIK.method_damped_least_squares, 0.01, 10)
+
+        # ---- prefer world (-1) as IK base
+        try:
+            _el = self.simIK.addIkElementFromScene(
+                self.ik_env, self.ik_group, self.h_tip, -1, self.h_target, self.simIK.constraint_pose
+            )
+            self.ik_base_ref = -1
+        except Exception as e_world:
+            # Fallback: use discovered model root as base
+            self.get_logger().warn(f"World-base IK element failed ({e_world}); "
+                                   f"trying model-root base (handle {self.h_base}).")
+            _el = self.simIK.addIkElementFromScene(
+                self.ik_env, self.ik_group, self.h_tip, self.h_base, self.h_target, self.simIK.constraint_pose
+            )
+            self.ik_base_ref = self.h_base
+
+        if _el is None or int(_el) < 0:
+            raise RuntimeError("simIK.addIkElementFromScene failed: got invalid element handle.")
+
+        # Slightly higher weight on orientation
+        self.simIK.setElementWeights(self.ik_env, self.ik_group, _el, [1,1,1, 2,2,2])
+
+        base_label = "world(-1)" if self.ik_base_ref == -1 else f"handle {self.ik_base_ref}"
+        self.get_logger().info(
+            f"Handles: tip={self.h_tip}, target={self.h_target}, mat={self.h_mat}, ik_base={base_label}"
+        )
+        self.get_logger().info("simIK environment initialized.")
+
+    def _resolve_exact_or_variants(self, name: str) -> Optional[int]:
+        tried = set()
+        for v in (name, name.lstrip("/"), f"{name}#0", f"/{name}", f"/{name}#0"):
+            if v in tried: continue
+            tried.add(v)
+            try:
+                return self.sim.getObject(v)
+            except Exception:
+                pass
+        return None
+
+    def _search_descendant_dummy(self, root: int, must_have_all: List[str], may_have_any: List[str]) -> Optional[int]:
+        try:
+            dummy_type = getattr(self.sim, "object_dummy_type", 5)
+            hs = self.sim.getObjectsInTree(root, dummy_type, 0)
+        except Exception:
+            hs = [root]
+            q = [root]
+            for _ in range(3):
+                nq = []
+                for h in q:
+                    try:
+                        ch = self.sim.getObjectsInTree(h, 0, 2)
+                        for c in ch:
+                            if c not in hs:
+                                hs.append(c); nq.append(c)
+                    except Exception:
+                        pass
+                q = nq
+
+        def is_dummy(h) -> bool:
+            try:
+                return self.sim.getObjectType(h) == getattr(self.sim, "object_dummy_type", 5)
+            except Exception:
+                return True
+
+        cands = []
+        for h in hs:
+            if not is_dummy(h): continue
+            try:
+                alias = self.sim.getObjectAlias(h, 1)
+            except Exception:
+                try: alias = self.sim.getObjectAlias(h)
+                except Exception: continue
+            al = alias.lower()
+            ok_all = all(tok in al for tok in must_have_all) if must_have_all else True
+            ok_any = any(tok in al for tok in may_have_any) if may_have_any else True
+            if ok_all and ok_any:
+                score = (len(must_have_all) + sum(tok in al for tok in may_have_any), -len(alias))
+                cands.append((score, h))
+        if not cands: return None
+        cands.sort(reverse=True)
+        return cands[0][1]
+
+    def _search_near(self, root: int, must_have_all: List[str], may_have_any: List[str]) -> Optional[int]:
+        try:
+            hs = self.sim.getObjectsInTree(root, 0, 0)
+        except Exception:
+            hs = [root]
+            q = [root]
+            for _ in range(3):
+                nq = []
+                for h in q:
+                    try:
+                        ch = self.sim.getObjectsInTree(h, 0, 2)
+                        for c in ch:
+                            if c not in hs:
+                                hs.append(c); nq.append(c)
+                    except Exception:
+                        pass
+                q = nq
+
+        for h in hs:
+            try:
+                alias = self.sim.getObjectAlias(h, 1)
+            except Exception:
+                try: alias = self.sim.getObjectAlias(h)
+                except Exception: continue
+            al = alias.lower()
+            ok_all = all(tok in al for tok in must_have_all) if must_have_all else True
+            ok_any = any(tok in al for tok in may_have_any) if may_have_any else True
+            if ok_all and ok_any:
+                return h
+        return None
+
+    def _dump_descendants(self, root: Optional[int], label="subtree"):
+        if root is None:
+            self.get_logger().error(f"No {label} to dump.")
+            return
+        self.get_logger().error(f"Listing descendant dummies in {label}:")
+        try:
+            dummy_type = getattr(self.sim, "object_dummy_type", 5)
+            hs = self.sim.getObjectsInTree(root, dummy_type, 0)
+            for i, h in enumerate(hs[:80]):
+                try:
+                    a = self.sim.getObjectAlias(h, 1)
+                except Exception:
+                    a = self.sim.getObjectAlias(h)
+                self.get_logger().info(f"  [{i:03d}] {a}")
+        except Exception as e:
+            self.get_logger().error(f"Descendant dump failed: {e}")
+
     def get_pose_rel(self, obj, ref):
         return self.sim.getObjectPose(obj, ref)  # [x,y,z,qx,qy,qz,qw]
 
-    def set_pose_rel(self, obj, ref, pose_xyzw):
-        self.sim.setObjectPose(obj, ref, pose_xyzw)
+    def set_target_pose_and_solve(self, pose_xyzw):
+        """Set target pose (relative to IK base) and run IK once."""
+        self.sim.setObjectPose(self.h_target, self.ik_base_ref, pose_xyzw)
+        self.simIK.handleGroup(self.ik_env, self.ik_group)
 
-    # ---- ROS utils ----
+    # -------- ROS utils --------
     def on_stop(self, msg: MsgBool):
         if msg.data:
             self._stop_flag = True
@@ -223,7 +362,7 @@ class SutureExecutor(Node):
 
     def publish_waypoints(self, poses_base: List[List[float]]):
         arr = PoseArray()
-        arr.header.frame_id = "base"
+        arr.header.frame_id = "world" if self.ik_base_ref == -1 else "base"
         for p in poses_base:
             pose = Pose()
             pose.position.x, pose.position.y, pose.position.z = p[0], p[1], p[2]
@@ -231,7 +370,7 @@ class SutureExecutor(Node):
             arr.poses.append(pose)
         self.pub_waypoints.publish(arr)
 
-    # ---- main callback ----
+    # -------- main callback --------
     def on_cuts(self, msg: MsgString):
         self.ensure_sim()
         self._stop_flag = False
@@ -267,7 +406,7 @@ class SutureExecutor(Node):
                     z_axis=mat_z
                 )
             else:
-                R = np.eye(3)
+                R = np.eye(3, dtype=float)
             R_list.append(R)
 
         approach_z = +abs(self.approach_m)
@@ -289,36 +428,36 @@ class SutureExecutor(Node):
             push(x, y, peck_z,     R, "down")
             push(x, y, approach_z, R, "up")
 
-        # MAT -> BASE transform
-        base_T_mat = self.get_pose_rel(self.h_mat, self.h_base)
-        p = np.array(base_T_mat[:3], float)
+        # MAT -> IK-BASE transform (world if ik_base_ref == -1)
+        base_T_mat = self.get_pose_rel(self.h_mat, self.ik_base_ref)
+        p = np.array(base_T_mat[:3], dtype=float)
         q = base_T_mat[3:7]
         Rb = _R_from_quat(*q)
-        T_base_mat = np.eye(4,float); T_base_mat[:3,:3] = Rb; T_base_mat[:3,3] = p
+        T_base_mat = np.eye(4, dtype=float); T_base_mat[:3,:3] = Rb; T_base_mat[:3,3] = p
 
         poses_base: List[List[float]] = []
         tags: List[str] = []
         for (pxyzw, tag) in seq_mat:
             px,py,pz,qx,qy,qz,qw = pxyzw
-            T_mat_tcp = np.eye(4,float)
+            T_mat_tcp = np.eye(4, dtype=float)
             T_mat_tcp[:3,:3] = _R_from_quat(qx,qy,qz,qw)
-            T_mat_tcp[:3,3]  = np.array([px,py,pz],float)
+            T_mat_tcp[:3,3]  = np.array([px,py,pz], dtype=float)
             T_base_tcp = T_base_mat @ T_mat_tcp
             pos = T_base_tcp[:3,3]
             quat = _quat_from_R(T_base_tcp[:3,:3])
             poses_base.append([pos[0],pos[1],pos[2], *quat])
             tags.append(tag)
 
-        # publish for visualization / external controllers
+        # publish for visualization
         self.publish_waypoints(poses_base)
         if self.dry_run:
             self.get_logger().info(f"[DRY] Generated {len(poses_base)} waypoints (peck profile).")
             return
 
-        # execute with interpolation and dwell at each 'down'
-        self.get_logger().info(f"Executing {len(poses_base)} waypoints...")
-        last_pose = self.get_pose_rel(self.h_target, self.h_base)
-        curr_p = np.array(last_pose[:3], float)
+        # execute with simIK solve on each sub-step
+        self.get_logger().info(f"Executing {len(poses_base)} waypoints (simIK)...")
+        last_pose = self.get_pose_rel(self.h_target, self.ik_base_ref)
+        curr_p = np.array(last_pose[:3], dtype=float)
         curr_q = tuple(last_pose[3:7])
 
         for i, pb in enumerate(poses_base):
@@ -326,20 +465,17 @@ class SutureExecutor(Node):
                 self.get_logger().warn("Stopped by /suture_stop")
                 break
 
-            next_p = np.array(pb[:3], float)
+            next_p = np.array(pb[:3], dtype=float)
             next_q = tuple(pb[3:7])
 
             for pos, quat in _interp_pose(curr_p, curr_q, next_p, next_q, step_m=self.travel_step):
                 if self._stop_flag:
                     break
-                self.set_pose_rel(self.h_target, self.h_base, _pose_to_list(pos, quat))
-                try:
-                    if hasattr(self.sim, "step"): self.sim.step()
-                except Exception:
-                    pass
-                time.sleep(self.dt)
+                self.set_target_pose_and_solve(_pose_to_list(pos, quat))
+                if self.dt > 0.0:
+                    time.sleep(self.dt)
 
-            if tags[i] == "down" and not self._stop_flag:
+            if tags[i] == "down" and not self._stop_flag and self.dwell_s > 0.0:
                 time.sleep(self.dwell_s)
 
             curr_p, curr_q = next_p, next_q
@@ -347,8 +483,7 @@ class SutureExecutor(Node):
         self.get_logger().info("Execution complete.")
 
 
-# ------------------------- entry point -------------------------
-
+# ---------------- entry ----------------
 def main():
     rclpy.init()
     node = SutureExecutor()
