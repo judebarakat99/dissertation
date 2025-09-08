@@ -66,6 +66,8 @@ setup(
             'UR3_targets_ik_node = suture_arm.UR3_targets_ik_node:main',
             'laparoscopic_ik_node = suture_arm.laparoscopic_ik_node:main',
             'cuts_to_targets_bridge = suture_arm.cuts_to_targets_bridge:main',
+            'vis_web = suture_arm.vis_web:main',
+            'lap_ik = suture_arm.lap_ik:main',
         ],
     },
 )
