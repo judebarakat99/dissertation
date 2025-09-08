@@ -10,7 +10,7 @@ import cv2
 from flask import Flask, Response, render_template, abort, make_response, request, redirect, url_for, jsonify
 from ament_index_python.packages import get_package_share_directory
 
-# ---- local modules (you created these) ----
+# ---- local modules ----
 # csim_frames MUST export: FrameGrabber, mjpeg_generator_raw, encode_jpeg
 from .csim_frames import FrameGrabber, mjpeg_generator_raw, encode_jpeg
 
@@ -143,7 +143,7 @@ def _select_weights_file() -> Optional[str]:
     models = _available_models()
     return os.path.join(MODELS_ROOT, models[0]) if models else None
 
-DETECTOR      = None  # (model, class_names, device)
+DETECTOR      = None  
 WEIGHTS_PATH  = None
 LAST_DETS     : Optional[Dict] = None
 LAST_FRAME_PIL: Optional["Image.Image"] = None
@@ -191,7 +191,6 @@ def _get_selected_crop_and_mask_np(det_id: Optional[int], pad: float = 0.08, out
 
     return crop_bgr, crop_mask
 
-# --- NEW helper: crop + mask + meta (offsets & full size) ---
 def _get_selected_crop_mask_and_meta(det_id: Optional[int], pad: float = 0.08, outw: Optional[int] = None):
     """
     Return:
@@ -216,7 +215,6 @@ def _get_selected_crop_mask_and_meta(det_id: Optional[int], pad: float = 0.08, o
     x1, y1, x2, y2 = [float(v) for v in boxes[det_id]]
     W_full, H_full = LAST_DETS.get("image_size", [LAST_FRAME_PIL.width, LAST_FRAME_PIL.height])
 
-    # asymmetric pad (wider horizontally); mirrors your snapshot route defaults
     pad_w = float(request.args.get("pad_w", default=pad * 2.2))
     pad_h = float(request.args.get("pad_h", default=pad))
     pw = pad_w * (x2 - x1); ph = pad_h * (y2 - y1)
@@ -457,7 +455,6 @@ def pattern_image():
         s_max          = request.args.get("s_max", default=60, type=int)
         px_per_mm_q    = request.args.get("px_per_mm", default=None, type=float)
 
-        # convert color to a scalar so stitching can safely int(color)
         thread_color_scalar = _color_to_scalar(thread_color)
 
         # clamp 5–10 mm
@@ -471,7 +468,6 @@ def pattern_image():
 
         H, W = crop_bgr.shape[:2]
         ppm_fallback = max(0.0, (float(W)/120.0 + float(H)/175.0) * 0.5)
-        # IMPORTANT: pass W, H as separate numbers (your mapper expects that)
         px_per_mm = (
             float(px_per_mm_q)
             if (px_per_mm_q not in (None, ""))
@@ -621,7 +617,7 @@ def move_robot():
         outside_scale=float(outside_scale),
         spur_min_px=4,
         entry_mm=float(entry_mm),
-        px_per_mm=None,  # drawing doesn't need true scale
+        px_per_mm=None,  
     )
 
     try:
@@ -807,7 +803,7 @@ def main():
 
     # Load optional calibration
     global PAD_MAPPER
-    PAD_MAPPER = load_pad_mapper(CALIB_PATH)  # your module handles "", missing files, etc.
+    PAD_MAPPER = load_pad_mapper(CALIB_PATH) 
 
     # ROS2 pub
     init_ros2_publisher()

@@ -473,7 +473,6 @@ def _ensure_progressive(path: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
 # Entry distance (mm) → pixels helper
 # ============================================================
 
-# --- in stitching.py ---
 def _entry_offset_px(entry_mm: float = 6.0,
                      px_per_mm: Optional[float] = None,
                      width_px: float = 0.0,
@@ -726,7 +725,6 @@ def draw_running_suture_auto(
         P = _centerline_from_mask(bin_mask, spur_min_px=int(spur_px))
         all_path += _draw_over_centerline(P, step_min=3.0)
 
-    # if nothing drew, try denser sampling and light mask dilations
     if not all_path:
         P = _centerline_from_mask(bin_mask, spur_min_px=int(spur_px))
         for factor in (0.75, 0.5):
@@ -756,7 +754,7 @@ def draw_running_suture_auto(
 
 
 # ============================================================
-# PUBLIC: Mold-border zig-zag (robust)
+# PUBLIC: Mold-border zig-zag 
 # ============================================================
 
 def _zigzag_from_lr(L_pts: List[Tuple[int,int]], R_pts: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
@@ -802,8 +800,8 @@ def draw_stitching_mold_border(
     border_push_px: float = 0.0,
     entry_mm: float = 4.0,
     px_per_mm: Optional[float] = None,
-    outside_scale: float = 0.12,          # NEW: accepted for compatibility (not used)
-    **kwargs,                              # NEW: absorb any future extras safely
+    outside_scale: float = 0.12,          
+    **kwargs,                              
 ) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
 
     out = bgr.copy()
@@ -1008,7 +1006,6 @@ def draw_stitching_bezier(
         path = _ensure_progressive(path)
         return path
 
-    # try progressively more forgiving settings
     base = float(spacing_px)
     tries: List[Tuple[np.ndarray, float, int, bool]] = []
 
@@ -1064,7 +1061,6 @@ def draw_running_suture_contour_spline(*args, **kwargs):
 def draw_running_suture_spline(*args, **kwargs):
     return draw_running_suture_auto(*args, **kwargs)
 
-# Aliases expected by vision_web dispatcher (pattern=perp|continuous|mold|bezier)
 def draw_stitching_perp(*args, **kwargs):
     return draw_stitching_pattern(*args, **kwargs)
 

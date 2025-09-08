@@ -7,7 +7,6 @@ Dataset capture from CoppeliaSim:
 - Reads /visionSensor frames
 - Moves UR3 joints through small jitters to create occlusions/variety
 - Saves raw images + overlay thumbnails + JSONL metadata
-- (Optional) small camera jitter per frame
 
 Env / defaults:
   CSIM_HOST=127.0.0.1

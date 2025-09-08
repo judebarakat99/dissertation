@@ -243,5 +243,4 @@ def draw_dets(img_pil, boxes, scores, labels, class_names, selected_index=None, 
     return img_pil
 
 
-# lightweight import of cv2 here to avoid circular import at top
-import cv2  # noqa: E402
+import cv2 

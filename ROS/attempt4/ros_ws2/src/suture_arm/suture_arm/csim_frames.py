@@ -45,7 +45,6 @@ def _decode_img(buf, w: int, h: int) -> np.ndarray:
         # RGBA
         img = np.flip(arr.reshape(h, w, 4), 0)[:, :, :3][:, :, ::-1]
     else:
-        # Sometimes img is float [0..1] list; or channel count is unexpected – try to guess.
         if (w * h) and n % (w * h) == 0:
             c = n // (w * h)
             img = np.flip(arr.reshape(h, w, c), 0)[:, :, :3][:, :, ::-1] if c >= 3 else np.flip(arr.reshape(h, w, 1), 0)

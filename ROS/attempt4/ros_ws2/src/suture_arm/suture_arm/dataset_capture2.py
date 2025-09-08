@@ -7,7 +7,6 @@ Dataset capture from CoppeliaSim with domain randomization:
 - Randomizes lights (diffuse/specular, orientation, occasional on/off)
 - Randomizes pad color (shapes under the 'mat' dummy)
 - Captures raw JPEGs + overlay thumbnails + JSONL metadata
-- (Optional) small camera jitter per frame
 
 Env / defaults:
   CSIM_HOST=127.0.0.1

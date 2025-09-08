@@ -293,7 +293,6 @@ class VisionTargetsIKNode(Node):
         self.declare_parameter("force_work_z", True)
         self.declare_parameter("home_on_start", True)
         self.declare_parameter("ik_damping", IK_DLS_DAMPING)
-        # --- NEW: tip name parameter (defaults to laparoscopic tool tip) ---
         self.declare_parameter("tip_name", "needle_tip")
 
         self.work_z          = float(self.get_parameter("work_z").value)
@@ -307,7 +306,6 @@ class VisionTargetsIKNode(Node):
         self.get_logger().info(f"Connecting to CoppeliaSim at {CSIM_HOST}:{CSIM_PORT} ...")
         self.sim = CoppeliaIK(self, tip_name=tip_name)
 
-        # allow damping override (NOTE: env handle required)
         try:
             self.sim.simIK.setGroupCalculation(self.sim.ikEnv, self.sim.ikGroup, self.sim.simIK.method_damped_least_squares, float(damping_in), 50)
             self.get_logger().info(f"simIK damping set to {float(damping_in)}")
