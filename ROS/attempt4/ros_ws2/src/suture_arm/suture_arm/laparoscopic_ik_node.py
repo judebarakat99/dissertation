@@ -55,7 +55,12 @@ UR3_MAX_REACH_M = 0.49
 IK_DLS_DAMPING        = 0.01     # λ
 IK_MAX_ITERS_PER_TICK = 3        # solver inner iters per sim step
 IK_TICK_COUNT         = 1200     # hard cap per target
-IK_POS_THR_M          = 0.0018   # ~1.8 mm
+#
+# Positional error tolerance for the inverse kinematics solver.  When the
+# positional error (tip→target distance) falls below this threshold, the
+# solver will move on to the next target.  The value of 0.004 m
+# corresponds to 4 mm, relaxing the previous ~1.8 mm tolerance.
+IK_POS_THR_M          = 0.004    # 0.004 m = 4 mm
 IK_TILT_THR_RAD       = math.radians(1.5)
 
 PRINT_EVERY_STEPS = 15
@@ -226,7 +231,20 @@ class CoppeliaIK:
         R = tft.euler_matrix(*rpy)[:3, :3]
         return pos, R
 
-    def ik_servo_to_target(self, timeout_s: float = 240.0):
+    def ik_servo_to_target(self, timeout_s: float = 240.0) -> Tuple[int, float, float]:
+        """
+        Run the simIK solver until the tip is sufficiently close to the target or
+        a timeout/hard iteration cap is reached.
+
+        Args:
+            timeout_s: maximum wall-clock seconds to run the servo.
+
+        Returns:
+            A tuple ``(steps, pos_err, tilt_err)`` where ``steps`` is the number of
+            simulation ticks taken, ``pos_err`` is the final positional error in
+            metres, and ``tilt_err`` is the final tilt error in radians.  The
+            positional error tolerance is determined by ``IK_POS_THR_M``.
+        """
         ik = self.simIK
         sim = self.sim
 
@@ -234,6 +252,9 @@ class CoppeliaIK:
         steps = 0
         opts = {"syncWorlds": True}  # pulls scene→IK, solves, pushes IK→scene
 
+        # initialise errors in case the loop exits immediately
+        pos_err = float('inf')
+        tilt_err = float('inf')
         while steps < IK_TICK_COUNT:
             for _ in range(IK_MAX_ITERS_PER_TICK):
                 ik.handleGroup(self.ikEnv, self.ikGroup, opts)
@@ -248,7 +269,9 @@ class CoppeliaIK:
 
             z_tip = R_tip[:, 2] / max(1e-9, np.linalg.norm(R_tip[:, 2]))
             z_tgt = R_tgt[:, 2] / max(1e-9, np.linalg.norm(R_tgt[:, 2]))
-            tilt_err = math.acos(float(np.clip(np.dot(z_tip, z_tgt), -1.0, 1.0)))
+            # tilt error defined as the angle between z-axis vectors (alpha/beta)
+            dot_val = float(np.clip(np.dot(z_tip, z_tgt), -1.0, 1.0))
+            tilt_err = math.acos(dot_val)
 
             if steps % PRINT_EVERY_STEPS == 0:
                 self.node.get_logger().info(
@@ -264,8 +287,20 @@ class CoppeliaIK:
                 )
                 break
 
+        # Ensure the simulation has settled by stepping a few more times
         for _ in range(3):
             sim.step()
+
+        # final error computation in case loop broke early
+        p_tip, R_tip = self.get_tip_pose_in_base()
+        p_tgt, R_tgt = self.get_target_pose_in_base()
+        pos_err = float(np.linalg.norm(p_tgt - p_tip))
+        z_tip = R_tip[:, 2] / max(1e-9, np.linalg.norm(R_tip[:, 2]))
+        z_tgt = R_tgt[:, 2] / max(1e-9, np.linalg.norm(R_tgt[:, 2]))
+        dot_val = float(np.clip(np.dot(z_tip, z_tgt), -1.0, 1.0))
+        tilt_err = math.acos(dot_val)
+
+        return steps, pos_err, tilt_err
 
     def home_all_joints_zero(self):
         for h in self.joints:
@@ -380,8 +415,7 @@ class VisionTargetsIKNode(Node):
                 elif x_norm > 1.0: x_norm = 1.0
                 if y_norm < 0.0: y_norm = 0.0
                 elif y_norm > 1.0: y_norm = 1.0
-                # Map to world coordinates.  Note that these values may lie outside
-                # the robot's reachable workspace and will be projected later.
+                # Map to world coordinates.  
                 x_world = -x_norm 
                 y_world = y_norm
                 pos_world = [x_world, y_world, 0.02]  # constant world Z
@@ -424,13 +458,14 @@ class VisionTargetsIKNode(Node):
                 self.sim.set_dummy_pose(pos_parent, rpy_parent if want_orientation else None)
                 self.get_logger().info(f"[unit {i+1}/{len(targets_raw)}] simIK servo to dummy ...")
                 t0 = time.time()
-                self.sim.ik_servo_to_target(timeout_s=240.0)
+                # run IK and capture final step count and errors
+                steps, pos_err, tilt_err = self.sim.ik_servo_to_target(timeout_s=240.0)
                 t_el = time.time() - t0
-                p_tip, _ = self.sim.get_tip_pose_in_base()
-                p_tgt, _ = self.sim.get_target_pose_in_base()
-                pos_res = float(np.linalg.norm(p_tip - p_tgt))
+                within_threshold = (pos_err <= IK_POS_THR_M)
                 self.get_logger().info(
-                    f"[unit {i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. Final tip→dummy dist = {pos_res*1000:.1f} mm"
+                    f"[unit {i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. pos_err={pos_err*1000:.1f} mm, "
+                    f"tilt_err={math.degrees(tilt_err):.1f} deg, ticks={steps}, "
+                    f"within_threshold={within_threshold}"
                 )
             self.get_logger().info("All unit targets processed.")
             return
@@ -474,16 +509,17 @@ class VisionTargetsIKNode(Node):
             )
             self.sim.set_dummy_pose(pos_parent, rpy_parent if want_orientation else None)
 
-            # Run simIK servo
+            # Run simIK servo and collect final metrics
             self.get_logger().info(f"[{i+1}/{len(targets_raw)}] simIK servo to dummy ...")
             t0 = time.time()
-            self.sim.ik_servo_to_target(timeout_s=240.0)
+            steps, pos_err, tilt_err = self.sim.ik_servo_to_target(timeout_s=240.0)
             t_el = time.time() - t0
-
-            p_tip, _ = self.sim.get_tip_pose_in_base()
-            p_tgt, _ = self.sim.get_target_pose_in_base()
-            pos_res = float(np.linalg.norm(p_tip - p_tgt))
-            self.get_logger().info(f"[{i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. Final tip→dummy dist = {pos_res*1000:.1f} mm")
+            within_threshold = (pos_err <= IK_POS_THR_M)
+            self.get_logger().info(
+                f"[{i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. pos_err={pos_err*1000:.1f} mm, "
+                f"tilt_err={math.degrees(tilt_err):.1f} deg, ticks={steps}, "
+                f"within_threshold={within_threshold}"
+            )
 
         self.get_logger().info("All targets processed.")
 

@@ -55,7 +55,12 @@ UR3_MAX_REACH_M = 0.49
 IK_DLS_DAMPING        = 0.01     # λ
 IK_MAX_ITERS_PER_TICK = 3        # solver inner iters per sim step
 IK_TICK_COUNT         = 1200     # hard cap per target
-IK_POS_THR_M          = 0.0018   # ~1.8 mm
+#
+# Positional error tolerance for the inverse kinematics solver.  When the
+# positional error (tip→target distance) falls below this threshold, the
+# solver will move on to the next target.  The value of 0.004 m
+# corresponds to 3 mm, relaxing the previous ~1.8 mm tolerance.
+IK_POS_THR_M          = 0.004    # 0.004 m = 4 mm
 IK_TILT_THR_RAD       = math.radians(1.5)
 
 PRINT_EVERY_STEPS = 15
@@ -226,7 +231,20 @@ class CoppeliaIK:
         R = tft.euler_matrix(*rpy)[:3, :3]
         return pos, R
 
-    def ik_servo_to_target(self, timeout_s: float = 240.0):
+    def ik_servo_to_target(self, timeout_s: float = 240.0) -> Tuple[int, float, float]:
+        """
+        Run the simIK solver until the tip is sufficiently close to the target or
+        a timeout/hard iteration cap is reached.
+
+        Args:
+            timeout_s: maximum wall-clock seconds to run the servo.
+
+        Returns:
+            A tuple ``(steps, pos_err, tilt_err)`` where ``steps`` is the number of
+            simulation ticks taken, ``pos_err`` is the final positional error in
+            metres, and ``tilt_err`` is the final tilt error in radians.  The
+            positional error tolerance is determined by ``IK_POS_THR_M``.
+        """
         ik = self.simIK
         sim = self.sim
 
@@ -234,6 +252,9 @@ class CoppeliaIK:
         steps = 0
         opts = {"syncWorlds": True}  # pulls scene→IK, solves, pushes IK→scene
 
+        # initialise errors in case the loop exits immediately
+        pos_err = float('inf')
+        tilt_err = float('inf')
         while steps < IK_TICK_COUNT:
             for _ in range(IK_MAX_ITERS_PER_TICK):
                 ik.handleGroup(self.ikEnv, self.ikGroup, opts)
@@ -248,7 +269,9 @@ class CoppeliaIK:
 
             z_tip = R_tip[:, 2] / max(1e-9, np.linalg.norm(R_tip[:, 2]))
             z_tgt = R_tgt[:, 2] / max(1e-9, np.linalg.norm(R_tgt[:, 2]))
-            tilt_err = math.acos(float(np.clip(np.dot(z_tip, z_tgt), -1.0, 1.0)))
+            # tilt error defined as the angle between z-axis vectors (alpha/beta)
+            dot_val = float(np.clip(np.dot(z_tip, z_tgt), -1.0, 1.0))
+            tilt_err = math.acos(dot_val)
 
             if steps % PRINT_EVERY_STEPS == 0:
                 self.node.get_logger().info(
@@ -264,8 +287,20 @@ class CoppeliaIK:
                 )
                 break
 
+        # Ensure the simulation has settled by stepping a few more times
         for _ in range(3):
             sim.step()
+
+        # final error computation in case loop broke early
+        p_tip, R_tip = self.get_tip_pose_in_base()
+        p_tgt, R_tgt = self.get_target_pose_in_base()
+        pos_err = float(np.linalg.norm(p_tgt - p_tip))
+        z_tip = R_tip[:, 2] / max(1e-9, np.linalg.norm(R_tip[:, 2]))
+        z_tgt = R_tgt[:, 2] / max(1e-9, np.linalg.norm(R_tgt[:, 2]))
+        dot_val = float(np.clip(np.dot(z_tip, z_tgt), -1.0, 1.0))
+        tilt_err = math.acos(dot_val)
+
+        return steps, pos_err, tilt_err
 
     def home_all_joints_zero(self):
         for h in self.joints:
@@ -293,7 +328,6 @@ class VisionTargetsIKNode(Node):
         self.declare_parameter("force_work_z", True)
         self.declare_parameter("home_on_start", True)
         self.declare_parameter("ik_damping", IK_DLS_DAMPING)
-        # --- NEW: tip name parameter (defaults to laparoscopic tool tip) ---
         self.declare_parameter("tip_name", "needle_tip")
 
         self.work_z          = float(self.get_parameter("work_z").value)
@@ -307,7 +341,6 @@ class VisionTargetsIKNode(Node):
         self.get_logger().info(f"Connecting to CoppeliaSim at {CSIM_HOST}:{CSIM_PORT} ...")
         self.sim = CoppeliaIK(self, tip_name=tip_name)
 
-        # allow damping override (NOTE: env handle required)
         try:
             self.sim.simIK.setGroupCalculation(self.sim.ikEnv, self.sim.ikGroup, self.sim.simIK.method_damped_least_squares, float(damping_in), 50)
             self.get_logger().info(f"simIK damping set to {float(damping_in)}")
@@ -339,6 +372,105 @@ class VisionTargetsIKNode(Node):
             self.get_logger().warn("No 'targets' in payload.")
             return
 
+        # Handle normalized/unit-frame targets.  When 'frame' is 'unit' or 'normalized',
+        # the payload's positions are normalized in [0,1] for both x and y axes.  We
+        # convert these to world coordinates using x→[-1,0] and y→[-0.5,0.5], and fix
+        # z to 0.02 m.  The mapping is: x_world = -1 + x_norm, y_world = -0.5 + y_norm.
+        # We then transform into the dummy's parent frame and servo to each point.
+        if frame in ("unit", "normalized", "unit_square", "unitframe", "unit-frame"):
+            # When the payload frame is 'unit' or similar, treat each position's x and y
+            # component as normalized coordinates in [0,1], with (0,0) at the top-left
+            # corner of the vision sensor view and (1,1) at the bottom-right.  The
+            # mapping to world coordinates is:
+            #   x_world = -x_norm           # 0→0, 1→-1 (sensor x axis left-to-right → world x axis right-to-left)
+            #   y_world =  0.5 - y_norm     # 0→0.5, 1→-0.5 (sensor y axis top-to-bottom → world y axis top positive)
+            # We then convert that world-frame pose into the target dummy's parent
+            # frame and set its Z to a fixed relative offset (-0.02303) so that its
+            # world Z ends up at approximately +0.02 m (given the base height is
+            # around +0.04303 m).  If XY are out of reach, we project them into
+            # the allowable workspace while leaving Z untouched.
+            # Constant Z relative to the parent (UR3 base).  If the base is roughly
+            # at Z=+0.04303 in the scene, then world_z=+0.02 corresponds to
+            # parent_z=-0.02303.
+            z_parent_const = -0.02303
+            for i, trg in enumerate(targets_raw):
+                # Extract normalized coordinates directly; avoid to_pose_dict since
+                # to_pose_dict expects length ≥3 for pos.
+                pos_norm = None
+                if isinstance(trg, dict):
+                    pos_norm = trg.get("pos")
+                elif isinstance(trg, (list, tuple)):
+                    pos_norm = trg
+                if not isinstance(pos_norm, (list, tuple)) or len(pos_norm) < 2:
+                    self.get_logger().warn(f"Skipping malformed unit target #{i}: pos missing or too short")
+                    continue
+                try:
+                    x_norm = float(pos_norm[0])
+                    y_norm = float(pos_norm[1])
+                except Exception as e:
+                    self.get_logger().warn(f"Skipping malformed unit target #{i}: {e}")
+                    continue
+                # Clamp normalized values into [0,1].
+                if x_norm < 0.0: x_norm = 0.0
+                elif x_norm > 1.0: x_norm = 1.0
+                if y_norm < 0.0: y_norm = 0.0
+                elif y_norm > 1.0: y_norm = 1.0
+                # Map to world coordinates.  Note that these values may lie outside
+                # the robot's reachable workspace and will be projected later.
+                x_world = -x_norm 
+                y_world = y_norm
+                pos_world = [x_world, y_world, 0.02]  # constant world Z
+                # Determine the desired orientation.  If force_down is True, use
+                # the configured down_rpy; otherwise, attempt to use an RPY from
+                # the message or keep the current orientation of the dummy.
+                if self.force_down:
+                    rpy_in = self.down_rpy
+                    want_orientation = True
+                else:
+                    rpy_raw = None
+                    if isinstance(trg, dict):
+                        rpy_raw = trg.get("rpy")
+                    want_orientation = rpy_raw is not None
+                    if want_orientation:
+                        try:
+                            rpy_in = tuple(float(v) for v in rpy_raw)
+                        except Exception:
+                            rpy_in = self.sim.sim.getObjectOrientation(self.sim.target, self.sim.target_parent)
+                            want_orientation = False
+                    else:
+                        rpy_in = self.sim.sim.getObjectOrientation(self.sim.target, self.sim.target_parent)
+                # Convert the world pose into the dummy's parent frame.  We use
+                # 'scene' for the frame argument, since pos_world is in the scene/world frame.
+                pos_parent, rpy_parent = self._to_parent_frame(pos_world, rpy_in, "scene")
+                # Override the Z component to a fixed relative offset so that the
+                # world Z ends up at +0.02.  We rely on the fact that this node
+                # uses UR3_target as a child of the UR3 base.
+                pos_parent = [pos_parent[0], pos_parent[1], z_parent_const]
+                # We no longer enforce a radial limit on unit-frame targets.  The dummy
+                # will be placed exactly at the mapped coordinates even if they are
+                # outside the robot's reachable workspace.  This may cause the IK
+                # solver to fail to converge if the point is unreachable, but it
+                # preserves the intended mapping for debugging/calibration.
+                # Log and execute the servo.
+                self.get_logger().info(
+                    f"[unit {i+1}/{len(targets_raw)}] Move dummy → pos={np.round(pos_parent,5).tolist()}, "
+                    f"rpy={tuple(round(v,5) for v in rpy_parent)} (normalized frame)"
+                )
+                self.sim.set_dummy_pose(pos_parent, rpy_parent if want_orientation else None)
+                self.get_logger().info(f"[unit {i+1}/{len(targets_raw)}] simIK servo to dummy ...")
+                t0 = time.time()
+                # run IK and capture final step count and errors
+                steps, pos_err, tilt_err = self.sim.ik_servo_to_target(timeout_s=240.0)
+                t_el = time.time() - t0
+                within_threshold = (pos_err <= IK_POS_THR_M)
+                self.get_logger().info(
+                    f"[unit {i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. pos_err={pos_err*1000:.1f} mm, "
+                    f"tilt_err={math.degrees(tilt_err):.1f} deg, ticks={steps}, "
+                    f"within_threshold={within_threshold}"
+                )
+            self.get_logger().info("All unit targets processed.")
+            return
+
         for i, trg in enumerate(targets_raw):
             try:
                 t = to_pose_dict(trg)
@@ -364,18 +496,13 @@ class VisionTargetsIKNode(Node):
             # Transform into dummy's parent frame (scene or base)
             pos_parent, rpy_parent = self._to_parent_frame(pos, rpy_in, frame)
 
-            # Workspace guard when target parent is UR3 base:
+            # If the dummy is parented to the UR3 base, we only adjust the Z
+            # coordinate to match the configured work plane (if force_work_z is
+            # enabled).  We no longer project XY into a safe radius.  This means
+            # that unreachable targets will be attempted as-is, which may
+            # result in the IK solver failing to converge or reaching a joint limit.
             if self.sim.target_parent == self.sim.base:
-                r_xy = float(np.linalg.norm([pos_parent[0], pos_parent[1]]))
-                if r_xy > (UR3_MAX_REACH_M - 0.02):
-                    scale = (UR3_MAX_REACH_M - 0.02) / r_xy
-                    pos_parent = [pos_parent[0]*scale, pos_parent[1]*scale, self.work_z]
-                    self.get_logger().warn(
-                        f"Target outside UR3 XY reach (r={r_xy:.3f} m > {UR3_MAX_REACH_M:.3f} m). "
-                        f"Projecting XY to {np.round(pos_parent[:2],5).tolist()} and clamping Z={self.work_z:.3f}."
-                    )
-                else:
-                    pos_parent = [pos_parent[0], pos_parent[1], self.work_z]
+                pos_parent = [pos_parent[0], pos_parent[1], self.work_z]
 
             self.get_logger().info(
                 f"[{i+1}/{len(targets_raw)}] Move dummy → pos={np.round(pos_parent,5).tolist()}, "
@@ -383,16 +510,17 @@ class VisionTargetsIKNode(Node):
             )
             self.sim.set_dummy_pose(pos_parent, rpy_parent if want_orientation else None)
 
-            # Run simIK servo
+            # Run simIK servo and collect final metrics
             self.get_logger().info(f"[{i+1}/{len(targets_raw)}] simIK servo to dummy ...")
             t0 = time.time()
-            self.sim.ik_servo_to_target(timeout_s=240.0)
+            steps, pos_err, tilt_err = self.sim.ik_servo_to_target(timeout_s=240.0)
             t_el = time.time() - t0
-
-            p_tip, _ = self.sim.get_tip_pose_in_base()
-            p_tgt, _ = self.sim.get_target_pose_in_base()
-            pos_res = float(np.linalg.norm(p_tip - p_tgt))
-            self.get_logger().info(f"[{i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. Final tip→dummy dist = {pos_res*1000:.1f} mm")
+            within_threshold = (pos_err <= IK_POS_THR_M)
+            self.get_logger().info(
+                f"[{i+1}/{len(targets_raw)}] Done in {t_el:.2f}s. pos_err={pos_err*1000:.1f} mm, "
+                f"tilt_err={math.degrees(tilt_err):.1f} deg, ticks={steps}, "
+                f"within_threshold={within_threshold}"
+            )
 
         self.get_logger().info("All targets processed.")
 

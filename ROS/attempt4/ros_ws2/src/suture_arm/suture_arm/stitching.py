@@ -54,7 +54,6 @@ def _debug_safe_return(out: np.ndarray, why: str) -> Tuple[np.ndarray, list]:
     cv2.putText(dbg, why, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
     return dbg, []
 
-
 # ============================================================
 # Small utilities
 # ============================================================
@@ -116,7 +115,6 @@ def _sample_along_polyline_by_step(P: np.ndarray, step: float) -> np.ndarray:
         if np.linalg.norm(Q[i] - Q[keep[-1]]) >= 0.75:
             keep.append(i)
     return Q[keep]
-
 
 # ============================================================
 # Skeleton build + pruning
@@ -202,7 +200,6 @@ def _poly_from_idx_list(coords: np.ndarray, seq: List[int]) -> np.ndarray:
     P = coords[np.array(seq, dtype=np.int32)][:, ::-1].astype(np.float32)  # -> (x,y)
     return P
 
-
 # ============================================================
 # Curve geometry: normals & curvature
 # ============================================================
@@ -238,7 +235,6 @@ def _signed_curvature(P: np.ndarray) -> np.ndarray:
     kappa = np.concatenate([[kappa[0]], kappa, [kappa[-1]]]).astype(np.float32)
     return kappa
 
-
 # ============================================================
 # Shape classification
 # ============================================================
@@ -256,7 +252,6 @@ def _classify_shape(cnt: np.ndarray) -> str:
     if ar <= 1.6:
         return "boomerang"
     return "snake"
-
 
 # ============================================================
 # Centerlines (single & arms)
@@ -309,7 +304,6 @@ def _boomerang_arms_centerlines(bin_mask: np.ndarray, cnt: np.ndarray, spur_min_
             arms.append(P)
     arms.sort(key=lambda P: _polyline_arclen(P)[1], reverse=True)
     return arms[:3]
-
 
 # ============================================================
 # Mask-based ray intersections (ROBUST)
@@ -380,7 +374,6 @@ def _nudge_inside_mask(bin_mask: np.ndarray, p: np.ndarray) -> np.ndarray:
                     best_d = d; best = np.array([float(xx), float(yy)], dtype=np.float32)
     return best if best is not None else p
 
-
 # ============================================================
 # Adaptive sampling along curve
 # ============================================================
@@ -434,7 +427,6 @@ def _sample_curve_adaptive(P: np.ndarray, base_step: float, alpha: float = 18.0)
             keep.append(i)
     return Q[keep]
 
-
 # ============================================================
 # Path helpers: anti-crossing & progression checks
 # ============================================================
@@ -467,7 +459,6 @@ def _ensure_progressive(path: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
     if np.std(y) < 2.0:
         return path[::-1]
     return path
-
 
 # ============================================================
 # Entry distance (mm) → pixels helper
@@ -503,7 +494,6 @@ def _entry_offset_px(entry_mm: float = 6.0,
 
     # Final offset is the maximum of: mm-based minimum, fixed px floor, and proportional-to-width.
     return float(max(min_px, float(outside_px), float(outside_scale) * float(width_px), entry_px))
-
 
 # ============================================================
 # Quadratic Bézier smoothing for the centerline
@@ -549,7 +539,6 @@ def _bezier_chain_from_polyline(P: np.ndarray, samples_per_seg: int = 16) -> np.
         if np.linalg.norm(S[i] - S[keep[-1]]) >= 0.75:
             keep.append(i)
     return S[keep].astype(np.float32)
-
 
 # ============================================================
 # PUBLIC: Perpendicular (curve-hugging staples)
@@ -628,10 +617,25 @@ def draw_stitching_pattern(
         return _debug_safe_return(out, "no pattern segments")
     return out, segments
 
-
 # ============================================================
 # PUBLIC: Continuous zig-zag (shape-aware)
 # ============================================================
+
+def _draw_dot(img: np.ndarray,
+              p: Tuple[int, int],
+              fill: Tuple[int,int,int] = (30, 200, 255),
+              radius: int = 3,
+              halo_color: Tuple[int,int,int] = (255, 255, 255),
+              ring_color: Tuple[int,int,int] = (0, 0, 0),
+              ring_thickness: int = 1):
+    """High-contrast dot: white halo + colored fill + thin black ring."""
+    # soft halo
+    cv2.circle(img, p, radius + 2, halo_color, -1, cv2.LINE_AA)
+    # solid fill
+    cv2.circle(img, p, radius, fill, -1, cv2.LINE_AA)
+    # crisp ring (optional)
+    if ring_thickness > 0:
+        cv2.circle(img, p, radius, ring_color, ring_thickness, cv2.LINE_AA)
 
 def draw_running_suture_auto(
     bgr: np.ndarray,
@@ -648,6 +652,10 @@ def draw_running_suture_auto(
     spur_min_px: int = 4,
     entry_mm: float = 4.0,
     px_per_mm: Optional[float] = None,
+    dot_radius: Optional[int] = None,
+    dot_halo_color: Tuple[int,int,int] = (255,255,255),
+    dot_ring_color: Tuple[int,int,int] = (0,0,0),
+    dot_ring_thickness: int = 1,
 ) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
     out = bgr.copy()
     raw_bin = _as_binary_mask(mask)
@@ -700,8 +708,12 @@ def draw_running_suture_auto(
         path = _ensure_progressive(path)
         for a, b in zip(path[:-1], path[1:]):
             cv2.line(out, a, b, color_thread, thickness, cv2.LINE_AA)
+        # determine a visible radius for dots
+        r = int(dot_radius) if dot_radius is not None else max(3, int(round(0.15 * float(spacing_px))))
         for pxy in path:
-            cv2.circle(out, pxy, 2, color_thread, -1, cv2.LINE_AA)
+            _draw_dot(out, pxy, fill=color_thread, radius=r,
+                      halo_color=dot_halo_color, ring_color=dot_ring_color,
+                      ring_thickness=int(dot_ring_thickness))
         if debug:
             cv2.polylines(out, [contour_xy.astype(np.int32)], True, (120,220,220), 1, cv2.LINE_AA)
         return path
@@ -745,13 +757,16 @@ def draw_running_suture_auto(
         all_path = _scanline_zigzag(bin_mask, step=int(max(6, spacing_px)))
         for a, b in zip(all_path[:-1], all_path[1:]):
             cv2.line(out, a, b, color_thread, thickness, cv2.LINE_AA)
+        # draw dots with halo and ring for scanline fallback
+        r = int(dot_radius) if dot_radius is not None else max(3, int(round(0.15 * float(spacing_px))))
         for pxy in all_path:
-            cv2.circle(out, pxy, 2, color_thread, -1, cv2.LINE_AA)
+            _draw_dot(out, pxy, fill=color_thread, radius=r,
+                      halo_color=dot_halo_color, ring_color=dot_ring_color,
+                      ring_thickness=int(dot_ring_thickness))
 
     if not all_path:
         return _debug_safe_return(out, "no stitch path")
     return out, all_path
-
 
 # ============================================================
 # PUBLIC: Mold-border zig-zag 
@@ -800,8 +815,12 @@ def draw_stitching_mold_border(
     border_push_px: float = 0.0,
     entry_mm: float = 4.0,
     px_per_mm: Optional[float] = None,
-    outside_scale: float = 0.12,          
-    **kwargs,                              
+    outside_scale: float = 0.12,
+    dot_radius: Optional[int] = None,
+    dot_halo_color: Tuple[int,int,int] = (255,255,255),
+    dot_ring_color: Tuple[int,int,int] = (0,0,0),
+    dot_ring_thickness: int = 1,
+    **kwargs,
 ) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
 
     out = bgr.copy()
@@ -875,8 +894,12 @@ def draw_stitching_mold_border(
     for a, b in zip(path[:-1], path[1:]):
         cv2.line(out, a, b, color_thread, int(thickness), cv2.LINE_AA)
     if draw_dots:
+        # compute radius for dots
+        r = int(dot_radius) if dot_radius is not None else max(3, int(round(0.15 * float(spacing_px))))
         for p in path:
-            cv2.circle(out, p, 2, dot_color, -1, cv2.LINE_AA)
+            _draw_dot(out, p, fill=dot_color, radius=r,
+                      halo_color=dot_halo_color, ring_color=dot_ring_color,
+                      ring_thickness=int(dot_ring_thickness))
 
     if not path:
         return _debug_safe_return(out, "no border path (after all retries)")
@@ -885,7 +908,6 @@ def draw_stitching_mold_border(
         if show_cnt is not None:
             cv2.polylines(out, [show_cnt.reshape(-1,2)], True, (200,200,200), 1, cv2.LINE_AA)
     return out, path
-
 
 # ============================================================
 # PUBLIC: Continuous (Bézier–smoothed centerline)
@@ -907,6 +929,10 @@ def draw_stitching_bezier(
     bezier_samples_per: int = 16,
     entry_mm: float = 4.0,
     px_per_mm: Optional[float] = None,
+    dot_radius: Optional[int] = None,
+    dot_halo_color: Tuple[int,int,int] = (255,255,255),
+    dot_ring_color: Tuple[int,int,int] = (0,0,0),
+    dot_ring_thickness: int = 1,
     **kwargs,
 ) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
     """
@@ -946,7 +972,9 @@ def draw_stitching_bezier(
         return draw_running_suture_auto(
             bgr, mask, spacing_px, outside_px, rect_min_step, max_probe,
             color_thread, thickness, debug, curvature_gain, outside_scale, spur_min_px,
-            entry_mm=entry_mm, px_per_mm=px_per_mm
+            entry_mm=entry_mm, px_per_mm=px_per_mm,
+            dot_radius=dot_radius, dot_halo_color=dot_halo_color,
+            dot_ring_color=dot_ring_color, dot_ring_thickness=dot_ring_thickness
         )
 
     def _attempt(m: np.ndarray, base_step: float, bez_samp: int, relax_offset: bool = False) -> List[Tuple[int,int]]:
@@ -1033,20 +1061,25 @@ def draw_stitching_bezier(
         return draw_running_suture_auto(
             bgr, mask, spacing_px, outside_px, rect_min_step, max_probe,
             color_thread, thickness, debug, curvature_gain, outside_scale, spur_min_px,
-            entry_mm=entry_mm, px_per_mm=px_per_mm
+            entry_mm=entry_mm, px_per_mm=px_per_mm,
+            dot_radius=dot_radius, dot_halo_color=dot_halo_color,
+            dot_ring_color=dot_ring_color, dot_ring_thickness=dot_ring_thickness
         )
 
     # draw
     for a, b in zip(path[:-1], path[1:]):
         cv2.line(out, a, b, color_thread, int(thickness), cv2.LINE_AA)
+    # determine radius for dots
+    r = int(dot_radius) if dot_radius is not None else max(3, int(round(0.15 * float(spacing_px))))
     for pxy in path:
-        cv2.circle(out, pxy, 2, color_thread, -1, cv2.LINE_AA)
+        _draw_dot(out, pxy, fill=color_thread, radius=r,
+                  halo_color=dot_halo_color, ring_color=dot_ring_color,
+                  ring_thickness=int(dot_ring_thickness))
 
     if debug:
         cv2.polylines(out, [cnt.reshape(-1,2)], True, (120,220,220), 1, cv2.LINE_AA)
 
     return out, path
-
 
 # ============================================================
 # Back-compat + UI aliases

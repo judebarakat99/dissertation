@@ -1,0 +1,18 @@
+%%{init: {"theme":"neutral","flowchart":{"curve":"linear"}}}%%
+flowchart LR
+_vision_targets_ik(["/vision_targets_ik"])
+_parameter_events(["/parameter_events"])
+_rosout(["/rosout"])
+_vision_targets(["/vision_targets"])
+_suture_cuts_web_publisher(["/suture_cuts_web_publisher"])
+_suture_cuts(["/suture_cuts"])
+_ros2graph_to_mermaid(["/ros2graph_to_mermaid"])
+_vision_targets_ik --> _parameter_events
+_vision_targets_ik --> _rosout
+_vision_targets --> _vision_targets_ik
+_suture_cuts_web_publisher --> _parameter_events
+_suture_cuts_web_publisher --> _rosout
+_suture_cuts_web_publisher --> _suture_cuts
+_suture_cuts_web_publisher --> _vision_targets
+_ros2graph_to_mermaid --> _parameter_events
+_ros2graph_to_mermaid --> _rosout
