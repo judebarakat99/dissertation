@@ -4991,3 +4991,9 @@ ROS/attempt3/ros_ws2/install/ur_description/share/ur_description/urdf/inc/ur_tra
 ROS/attempt3/ros_ws2/log/COLCON_IGNORE
 ROS/attempt3/ros_ws2/log/latest
 ROS/attempt3/ros_ws2/log/latest_build
+ROS/attempt4/ros_ws2/src/suture_arm/ML_detection/cuts_detector_best.pth
+ROS/attempt4/ros_ws2/src/suture_arm/ML_detection/cuts_detector_best2.pth
+ROS/attempt4/ros_ws2/src/suture_arm/ML_detection/cuts_maskrcnn_best.pth
+ROS/attempt4/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector.pth
+ROS/attempt4/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector2.pth
+ROS/attempt4/ros_ws2/src/suture_arm/ML_detection/mask_cuts_detector3.pth
